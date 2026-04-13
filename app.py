@@ -18,11 +18,17 @@ from sync_queue import start_sync_worker
 start_sync_worker()
 
 # ── Africa's Talking init ─────────────────────────────────────
-africastalking.initialize(
-    username="sandbox",
-    api_key=os.environ.get("AT_API_KEY")
-)
+AT_USERNAME = os.getenv("AT_USERNAME")
+AT_API_KEY = os.getenv("AT_API_KEY")
 
+if AT_USERNAME and AT_API_KEY:
+    africastalking.initialize(
+        username=AT_USERNAME,
+        api_key=AT_API_KEY
+    )
+    print("[AT] Africa's Talking initialized successfully")
+else:
+    print("[AT WARNING] Missing AT credentials - running without Africa's Talking")
 
 # ══════════════════════════════════════════════════════════════
 #  Structured terminal logger
