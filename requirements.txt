@@ -60,7 +60,7 @@ more-itertools==11.0.1
 mpmath==1.3.0
 networkx==3.4.2
 numba==0.65.0
-onnxruntime>=1.24.1
+onnxruntime==1.24.4
 openai==2.30.0
 openai-whisper==20250625
 packaging==26.0
