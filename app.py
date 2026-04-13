@@ -476,9 +476,12 @@ def on_connect():
 def on_disconnect():
     Log.info("Dashboard disconnected")
 
-
 if __name__ == "__main__":
-    Log.section("Kingolik NGO Voice Bridge")
-    Log.ok("Flask starting  port=5000")
-    Log.divider()
-socketio.run(app, debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+
+    socketio.run(
+        app,
+        host="0.0.0.0",   # VERY IMPORTANT
+        port=port,        # VERY IMPORTANT
+        debug=False
+    )
