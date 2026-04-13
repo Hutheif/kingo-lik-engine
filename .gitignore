@@ -1,0 +1,54 @@
+# ==============================
+# SECURITY (CRITICAL)
+# ==============================
+.env
+.env.*
+*.pem
+*.key
+
+# ==============================
+# DATABASES & STATE
+# ==============================
+kingolik.db
+sessions.json
+sessions_backup.json
+pending_sync.json
+
+# ==============================
+# AUDIO / MEDIA (SENSITIVE + LARGE)
+# ==============================
+recordings/
+*.wav
+*.mp3
+*.m4a
+*.log
+
+# ==============================
+# PYTHON CACHE
+# ==============================
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# ==============================
+# ENVIRONMENT / VIRTUAL ENV
+# ==============================
+venv/
+.venv/
+
+# ==============================
+# IDE / EDITORS
+# ==============================
+.vscode/
+.idea/
+
+# ==============================
+# OS FILES
+# ==============================
+.DS_Store
+Thumbs.db
+
+# ==============================
+# DEPLOYMENT / LOCAL TOOLS
+# ==============================
+start.bat

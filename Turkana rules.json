@@ -1,0 +1,153 @@
+{
+  "language": "Ngaturkana (Turkana)",
+  "source": "Dimmendaal 1983 + Barrett 1988 + Rosetta Project morphosyntax",
+  "purpose": "RAG injection to improve Gemini translation accuracy on Turkana voice recordings",
+
+  "sentence_structure": {
+    "default_order": "VSO (Verb + Subject + Object)",
+    "example": "alosi ayong moi locor = I will go tomorrow to the well",
+    "note": "Element can be fronted for emphasis. Front element = stressed information.",
+    "stress_examples": [
+      "moi alosi ayong locor = TOMORROW I will go to the well",
+      "locor alosi ayong moi = It is to THE WELL I will go tomorrow"
+    ],
+    "emergency_implication": "If a word appears FIRST in a Turkana sentence, it is the most urgent information."
+  },
+
+  "verb_classes": {
+    "note": "CRITICAL for translation accuracy. Wrong class = wrong meaning.",
+    "K_class": {
+      "marker": "K prefix",
+      "vowels": "a or o",
+      "types": ["K.A.", "K.O."],
+      "examples": {
+        "KA": "akilip = to beg/pray",
+        "KO": "akiyok = to herd"
+      }
+    },
+    "T_class": {
+      "marker": "T prefix",
+      "vowels": "a or o",
+      "types": ["T.A.", "T.O."],
+      "examples": {
+        "TA": "akicap = to weed",
+        "TO": "akiper = to rest/sleep"
+      }
+    },
+    "causative_K": "s + vowel prefix (e.g. akisilip = to cause to beg)",
+    "causative_T": "t + vowel prefix (e.g. akitoper = to cause to rest)"
+  },
+
+  "tenses": {
+    "future_marker": "+ moi (e.g. elipi moi = I will pray)",
+    "negative_prefix": "ny- (e.g. nyelipi = I am not praying)",
+    "negative_alternative": "pa + verb (e.g. pa alosi = I am not going)",
+    "emergency_note": "CRITICAL: ny- prefix negates the entire action. Missing this = catastrophic mistranslation. 'nyepi' does NOT mean eating — it means NOT eating."
+  },
+
+  "pronouns": {
+    "I": "ayong",
+    "you": "iyong",
+    "she_he": "inges",
+    "we": "ngoni / sua",
+    "you_plural": "iyesi",
+    "they": "ikes"
+  },
+
+  "possessive_adjectives": {
+    "my": "kang",
+    "your": "kon",
+    "his": "keng",
+    "our": "yok / kosi",
+    "your_plural": "kus",
+    "their": "kec"
+  },
+
+  "emergency_vocabulary": {
+    "water": "ngakipi (plural, feminine)",
+    "milk": "ngakile",
+    "food_generic": "kimuj / adyokimuj (some food)",
+    "fire": "see verb akimur / related forms",
+    "child": "ikoku (singular) / ngide (plural)",
+    "woman": "aberu (singular) / ngaberu (plural)",
+    "man": "ekile (singular) / ngikiliok or ngigiliok (plural)",
+    "mother": "ito (singular) / taito (plural)",
+    "father": "apa (singular) / taapa (plural)",
+    "north": "Kuju",
+    "south": "Kwap",
+    "east": "Kide",
+    "west": "Too",
+    "help_beg": "akilip (K.A.) = to beg/pray for help",
+    "urgent_help": "kilip = imperative: YOU beg/ask for help NOW",
+    "rest_sleep": "akiper (T.O.) — used in medical context: patient needs to rest",
+    "herd_move": "akiyok (K.O.) — also implies moving/relocating animals or people"
+  },
+
+  "noun_gender": {
+    "feminine_singular": "a-",
+    "feminine_plural": "nga-",
+    "masculine_singular": "e-",
+    "masculine_plural": "ngi-",
+    "neuter_singular": "i-",
+    "neuter_plural": "ngi-",
+    "kinship_feminine": "na- (e.g. nakaato = my sister)",
+    "kinship_masculine": "lo- (e.g. lokaato = my brother)"
+  },
+
+  "numbers_quantity": {
+    "some_little_singular": "edyo / adyo / idyo",
+    "some_little_plural": "ngidi / ngadi",
+    "examples": {
+      "ngadikipi": "some little water",
+      "adyokiring": "some meat",
+      "ngadikile": "some milk"
+    }
+  },
+
+  "question_words": {
+    "who": "ngae (singular) / tangae (plural)",
+    "where": "ai / nyali / nyani / nyanu",
+    "why": "nyo / kainyo",
+    "when": "ori",
+    "how_many": "ngiai (masculine) / ngaai (feminine)",
+    "for_what_reason": "anukiro",
+    "in_what_manner": "inyo"
+  },
+
+  "dialect_notes": {
+    "sources": "Barrett 1988, Dimmendaal 1983",
+    "variants": [
+      "Kakuma area: slight phonological variations in vowel length",
+      "Lokichoggio corridor: closer to Topossa influence — foreign people names are masculine, their languages feminine",
+      "Karamoja variant: documented by Hulley 1923 — shared roots with Karamoja and Topossa",
+      "North Turkana vs South Turkana: tonal register differences affect verb class identification"
+    ],
+    "code_switching": "Speakers in Kakuma refugee camp often mix Turkana + Kiswahili + English. Treat each word independently for keyword detection."
+  },
+
+  "translation_validation_rules": [
+    {
+      "rule": "NEGATION CHECK",
+      "check": "If ny- prefix appears, translation MUST contain 'not' or 'no' or 'without'",
+      "critical": true,
+      "example": "nyapei ≠ there is water — it means THERE IS NO water"
+    },
+    {
+      "rule": "FRONT-ELEMENT URGENCY",
+      "check": "First word in sentence = most stressed. If it is an emergency word, flag URGENT",
+      "critical": true
+    },
+    {
+      "rule": "WATER PLURAL",
+      "check": "ngakipi is plural feminine — 'some water' not 'a water'",
+      "critical": false
+    },
+    {
+      "rule": "IMPERATIVE DETECTION",
+      "check": "kilip / kiyok / tacap / toper = imperative commands (DO THIS NOW). Flag as urgent.",
+      "critical": true
+    }
+  ],
+
+  "gemini_injection_prompt": "You are translating a voice recording from Turkana (Ngaturkana). Apply these linguistic rules: (1) Turkana sentence order is VSO — the FIRST word is the most stressed/urgent element. (2) The prefix ny- or pa+ NEGATES the verb — 'nyapei' means NO WATER not 'there is water'. (3) Imperative forms kilip/kiyok/tacap/toper mean DO THIS NOW — flag as urgent. (4) ngakipi = water (plural feminine). ikoku/ngide = child/children. (5) Code-switching between Turkana, Kiswahili, and English is common in Kakuma — translate each language segment independently."
+}
