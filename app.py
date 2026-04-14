@@ -109,8 +109,8 @@ else:
 # ══════════════════════════════════════════════════════════════
 _rate_store = defaultdict(list)
 _rate_lock  = threading.Lock()
-RATE_LIMIT  = 3
-RATE_WINDOW = 3600
+RATE_LIMIT  = 
+RATE_WINDOW = 
 
 
 def _is_rate_limited(phone: str) -> bool:
