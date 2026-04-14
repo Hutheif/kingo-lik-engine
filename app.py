@@ -1,39 +1,82 @@
-# app.py
+# app.py — King'olik NGO Voice Bridge
 from flask_socketio import SocketIO
-from flask import Flask, request, make_response, jsonify
+from flask import Flask, request, make_response, jsonify, send_file
 import africastalking
-import os, json, datetime, threading, logging, time
+import os, re, json, datetime, threading, logging, time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+app      = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
 # ── Register dashboard blueprint ──────────────────────────────
 from dashboard import dashboard_bp
 app.register_blueprint(dashboard_bp)
 
-# Start background sync worker
+# ── Start background sync worker ──────────────────────────────
 from sync_queue import start_sync_worker
 start_sync_worker()
 
 # ── Africa's Talking init ─────────────────────────────────────
-AT_USERNAME = os.getenv("AT_USERNAME")
-AT_API_KEY = os.getenv("AT_API_KEY")
+AT_USERNAME = os.getenv("AT_USERNAME", "sandbox")
+AT_API_KEY  = os.getenv("AT_API_KEY", "")
 
-if AT_USERNAME and AT_API_KEY:
-    africastalking.initialize(
-        username=AT_USERNAME,
-        api_key=AT_API_KEY
-    )
-    print("[AT] Africa's Talking initialized successfully")
+if AT_API_KEY:
+    africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
+    print(f"[AT] Initialized  username={AT_USERNAME}")
 else:
-    print("[AT WARNING] Missing AT credentials - running without Africa's Talking")
+    print("[AT WARNING] No AT_API_KEY — running without Africa's Talking")
+    #To get the "Flash-to-Callback"This route handles the logic where the system "sees" the call to +254711082547, rejects it to save the user money, and then calls them back
+@app.route("/voice", methods=['POST'])
+def voice_callback():
+    # 1. Get the caller's info
+    caller_number = request.values.get("callerNumber")
+    is_active     = request.values.get("isActive") 
+
+    # 2. Safety Check (Whitelist & Rate Limiter)
+    if ALLOWED_PHONES and caller_number not in ALLOWED_PHONES:
+        Log.warn(f"Blocked unauthorized flash from {caller_number}")
+        return '<Response><Reject/></Response>'
+
+    if is_active == '1' and _is_rate_limited(caller_number):
+        Log.warn(f"Rate limit exceeded for {caller_number}")
+        return '<Response><Reject/></Response>'
+
+    # 3. The "Flash" Logic
+    if is_active == '1':
+        Log.info(f"Flash received from {caller_number}. Initiating AI Callback...")
+
+        if voice_service:
+            try:
+                # This triggers the call FROM your number TO the user
+                voice_service.call("+254711082547", [caller_number])
+                Log.ok(f"Callback command sent for {caller_number}")
+            except Exception as e:
+                Log.error(f"Voice API failed: {str(e)}")
+
+        # 4. REJECT the incoming call so the user is charged KES 0.00
+        return '<Response><Reject/></Response>'
+
+    return ""
+
+
+# ── Phone whitelist — cost protection ─────────────────────────
+# Set ALLOWED_PHONES=+254700000001,+254700000002 in .env
+# Leave blank to allow all phones (sandbox testing mode)
+_raw_whitelist = os.getenv("ALLOWED_PHONES", "")
+ALLOWED_PHONES = set(
+    p.strip() for p in _raw_whitelist.split(",") if p.strip()
+) if _raw_whitelist else set()
+
+if ALLOWED_PHONES:
+    print(f"[SECURITY] Whitelist active: {len(ALLOWED_PHONES)} authorised numbers")
+else:
+    print("[SECURITY] No whitelist — all phones accepted (sandbox mode)")
+
 
 # ══════════════════════════════════════════════════════════════
 #  Structured terminal logger
-#  Log.info / .ok / .warn / .error / .ussd / .translate / .audio
-#  Timestamped so `grep` and `tail -f` work cleanly in production.
 # ══════════════════════════════════════════════════════════════
 class Log:
     RESET  = "\033[0m";  BOLD   = "\033[1m";  DIM    = "\033[2m"
@@ -71,25 +114,6 @@ class Log:
         )
 
     @classmethod
-    def translate(cls, session_id, engine, score=None):
-        short     = session_id[-8:] if session_id else "?"
-        score_str = f"  score={score}" if score else ""
-        tag = (f"{cls.BLUE}CLOUD{cls.RESET}" if engine == "cloud"
-               else f"{cls.YELLOW}LOCAL{cls.RESET}")
-        print(
-            f"{cls.DIM}{cls._ts()}{cls.RESET}  {cls.BOLD}XLAT {cls.RESET}"
-            f"  {tag}  {cls.DIM}[...{short}]{cls.RESET}{score_str}"
-        )
-
-    @classmethod
-    def audio(cls, session_id, filename):
-        short = session_id[-8:] if session_id else "?"
-        print(
-            f"{cls.DIM}{cls._ts()}{cls.RESET}  {cls.GREEN}AUDIO{cls.RESET}"
-            f"  {cls.DIM}[...{short}]{cls.RESET}  -> {filename}"
-        )
-
-    @classmethod
     def section(cls, title):
         bar = "─" * max(0, 48 - len(title))
         print(f"\n{cls.DIM}┌── {title} {bar}{cls.RESET}")
@@ -99,53 +123,45 @@ class Log:
         print(f"{cls.DIM}{'─' * 54}{cls.RESET}")
 
 
-
 # ══════════════════════════════════════════════════════════════
-#  Rate limiter — anti-fraud, anti-prank-call protection
-#  Max 3 USSD reports per phone number per hour.
-#  Protects AT balance and Gemini API credits.
+#  Rate limiter — max 3 reports per phone per hour
 # ══════════════════════════════════════════════════════════════
 import time as _time
 from collections import defaultdict
 
-_rate_store   = defaultdict(list)   # phone -> [timestamps]
-_rate_lock    = threading.Lock()
-RATE_LIMIT    = 3       # max reports per window
-RATE_WINDOW   = 3600    # 1 hour in seconds
+_rate_store = defaultdict(list)
+_rate_lock  = threading.Lock()
+RATE_LIMIT  = 3
+RATE_WINDOW = 3600
 
 
 def _is_rate_limited(phone: str) -> bool:
-    """Returns True if this phone has exceeded the limit."""
     now = _time.time()
     with _rate_lock:
-        timestamps = _rate_store[phone]
-        # Drop timestamps outside the window
-        _rate_store[phone] = [t for t in timestamps if now - t < RATE_WINDOW]
+        _rate_store[phone] = [t for t in _rate_store[phone] if now - t < RATE_WINDOW]
         if len(_rate_store[phone]) >= RATE_LIMIT:
             return True
         _rate_store[phone].append(now)
         return False
 
 
-# ── Silence Flask werkzeug HTTP log for high-frequency routes ─
+# ── Silence Flask poll noise ──────────────────────────────────
 class _PollFilter(logging.Filter):
-    """Drop GET /api/sessions, /api/audio/*, /favicon.ico lines.
-    Everything else (USSD, test routes, errors) still prints."""
     def filter(self, record):
         m = record.getMessage()
         return (
             '"/api/sessions'  not in m and
             '"/api/audio/'    not in m and
-            '"/favicon.ico'   not in m
+            '"/favicon.ico'   not in m and
+            '"/api/analytics' not in m
         )
 
 logging.getLogger("werkzeug").addFilter(_PollFilter())
 
 
-# ── Log every meaningful incoming request ────────────────────
 @app.before_request
 def log_request():
-    silent = {'/api/sessions', '/dashboard', '/favicon.ico'}
+    silent = {'/api/sessions', '/dashboard', '/analytics', '/favicon.ico'}
     if request.path in silent or request.path.startswith('/api/audio/'):
         return
     meaningful_args = {k: v for k, v in request.args.items() if k != 't'}
@@ -155,8 +171,6 @@ def log_request():
 
 # ══════════════════════════════════════════════════════════════
 #  USSD handler
-#  FIX: .endswith() instead of exact match — handles handsets
-#  that accumulate navigation history in the text string.
 # ══════════════════════════════════════════════════════════════
 @app.route("/ussd", methods=["POST"])
 def ussd():
@@ -168,6 +182,16 @@ def ussd():
 
     Log.ussd(session_id, phone_number, text)
 
+    # ── Whitelist check ───────────────────────────────────────
+    if ALLOWED_PHONES and phone_number not in ALLOWED_PHONES:
+        Log.warn(f"Blocked non-whitelisted number: {phone_number}")
+        resp = make_response(
+            "END This humanitarian system is restricted to authorised field personnel only.",
+            200
+        )
+        resp.headers["Content-Type"] = "text/plain"
+        return resp
+
     if text == "":
         response = (
             "CON Karibu / Welcome\n"
@@ -177,27 +201,21 @@ def ussd():
         )
 
     elif text in ("1", "2", "3"):
-        labels = {
-            "1": "Report an issue",
-            "2": "Request assistance",
-            "3": "Leave a voice message"
-        }
+        labels = {"1": "Report an issue", "2": "Request assistance", "3": "Leave a voice message"}
         response = f"CON {labels[text]}:\n1. Confirm callback\n0. Cancel"
 
     elif text.endswith("*1"):
-        # ── Rate limit check ──────────────────────────────────
+        # Rate limit check
         if _is_rate_limited(phone_number):
-            remaining = RATE_WINDOW // 60
             Log.warn(f"Rate limit hit: {phone_number}")
-            response = (
-                "END Limit imefikiwa. Jaribu baadaye.\n"
-                f"(Limit reached. Try again in {remaining} min.)"
+            resp = make_response(
+                f"END Limit imefikiwa. Jaribu baadaye.\n(Limit reached. Try again in 60 min.)",
+                200
             )
-            resp = make_response(response, 200)
             resp.headers["Content-Type"] = "text/plain"
             return resp
 
-        menu_choice = text.split("*")[0]
+        menu_choice  = text.split("*")[0]
         session_data = {
             "session_id": session_id,
             "phone":       phone_number,
@@ -232,13 +250,9 @@ def ussd():
 
 
 # ══════════════════════════════════════════════════════════════
-#  Voice callback trigger
-#  FIX (race condition): snapshot the source WAV at dispatch
-#  time — NOT after sleeping — so two concurrent sessions cannot
-#  steal each other's audio file.
+#  WAV picker + callback trigger
 # ══════════════════════════════════════════════════════════════
 def _pick_source_wav():
-    """Return the absolute path of the newest non-derived WAV, or None."""
     recordings_dir = os.path.join(os.getcwd(), "recordings")
     try:
         candidates = [
@@ -258,19 +272,15 @@ def _pick_source_wav():
 
 
 def trigger_callback(phone_number, session_id):
-    # Snapshot NOW before the 2s sleep — this is the race-condition fix
     file_path = _pick_source_wav()
-
     if not file_path:
-        Log.warn(f"No source WAV at dispatch — session [...{session_id[-8:]}] will stall")
+        Log.warn(f"No source WAV — [...{session_id[-8:]}] stalled")
         return
-
     Log.info(f"Callback queued  [...{session_id[-8:]}]  file={os.path.basename(file_path)}")
 
     def process():
-        time.sleep(2)  # grace period for file to finish writing
-        size = os.path.getsize(file_path)
-        Log.info(f"Processing start [...{session_id[-8:]}]  {size} bytes")
+        time.sleep(2)
+        Log.info(f"Processing start [...{session_id[-8:]}]  {os.path.getsize(file_path)} bytes")
         from translator import process_recording
         process_recording(session_id, file_path, phone_number)
 
@@ -303,139 +313,89 @@ def voice_record():
     <Say voice="woman" playBeep="true">
         Habari. Karibu. This call is free. Please speak your message after the beep. Press hash when done.
     </Say>
-    <Record
-        finishOnKey="#"
-        maxLength="120"
-        trimSilence="true"
-        playBeep="true"
-        callbackUrl="{base_url}/voice/record?session_id={session_id}"
-    />
+    <Record finishOnKey="#" maxLength="120" trimSilence="true" playBeep="true"
+            callbackUrl="{base_url}/voice/record?session_id={session_id}"/>
 </Response>"""
     resp = make_response(xml, 200)
     resp.headers["Content-Type"] = "application/xml"
     return resp
 
 
-# ── TEST: local wav file ──────────────────────────────────────
+# ── Test routes ───────────────────────────────────────────────
 @app.route("/test/local", methods=["GET"])
 def test_local():
     from translator import process_recording
-
     session_id = request.args.get(
         "session_id",
         f"local_test_{datetime.datetime.utcnow().strftime('%H%M%S')}"
     )
-
     if request.args.get("file"):
         abs_path = os.path.join(os.getcwd(), request.args.get("file"))
     else:
         abs_path = _pick_source_wav()
         if not abs_path:
             return jsonify({"error": "No source WAV files in recordings/"}), 404
-
     if not os.path.exists(abs_path):
         return jsonify({"error": f"File not found: {abs_path}"}), 404
-
     Log.info(f"Test local  session={session_id[-8:]}  file={os.path.basename(abs_path)}")
-    threading.Thread(
-        target=process_recording, args=(session_id, abs_path), daemon=True
-    ).start()
+    threading.Thread(target=process_recording, args=(session_id, abs_path), daemon=True).start()
+    return jsonify({"status": "processing started", "session_id": session_id,
+                    "file": os.path.basename(abs_path)}), 200
 
-    return jsonify({
-        "status": "processing started",
-        "session_id": session_id,
-        "file": os.path.basename(abs_path)
-    }), 200
+
+@app.route("/test/file/<filename>", methods=["GET"])
+def test_file(filename):
+    from translator import process_recording
+    session_id = f"local_test_{datetime.datetime.utcnow().strftime('%H%M%S')}"
+    file_path  = os.path.join(os.getcwd(), "recordings", filename)
+    if not os.path.exists(file_path):
+        available = [f for f in os.listdir("recordings")
+                     if f.endswith(".wav") and "_clean" not in f]
+        return jsonify({"error": f"{filename} not found", "available": available}), 404
+    Log.info(f"Test file  session={session_id[-8:]}  file={filename}")
+    threading.Thread(target=process_recording, args=(session_id, file_path), daemon=True).start()
+    return jsonify({"status": "processing started", "file": filename,
+                    "session_id": session_id}), 200
+
+
+@app.route("/test/url", methods=["GET"])
+def test_url():
+    from translator import process_recording
+    audio_url  = request.args.get("url", "")
+    if not audio_url:
+        return jsonify({"error": "url parameter required"}), 400
+    session_id = f"url_test_{datetime.datetime.utcnow().strftime('%H%M%S')}"
+    Log.info(f"Test URL  session={session_id}")
+    threading.Thread(target=process_recording, args=(session_id, audio_url), daemon=True).start()
+    return jsonify({"status": "processing started", "session_id": session_id}), 200
 
 
 @app.route("/test/latest", methods=["GET"])
 def test_latest():
     from translator import process_recording
     from database import _load
-
     sessions = _load()
-    pending  = [
-        s for s in sessions.values()
-        if s.get("status") == "pending_call" and s.get("phone") != "local-test"
-    ]
+    pending  = [s for s in sessions.values()
+                if s.get("status") == "pending_call" and s.get("phone") != "local-test"]
     if not pending:
-        return jsonify({
-            "error": "No pending sessions found",
-            "tip":   "Dial *384*67660# on the simulator first"
-        }), 404
-
-    latest     = sorted(pending, key=lambda x: x.get("timestamp", ""), reverse=True)[0]
+        return jsonify({"error": "No pending sessions", "tip": "Dial *384*67660# first"}), 404
+    latest     = sorted(pending, key=lambda x: x.get("timestamp",""), reverse=True)[0]
     session_id = latest["session_id"]
     phone      = latest["phone"]
-
-    file_path = os.path.join(os.getcwd(), "recordings", "test_audio.wav")
+    file_path  = os.path.join(os.getcwd(), "recordings", "test_audio.wav")
     if not os.path.exists(file_path):
         return jsonify({"error": "recordings/test_audio.wav not found"}), 404
-
     Log.info(f"Test latest  [...{session_id[-8:]}]  phone={phone}")
-    threading.Thread(
-        target=process_recording, args=(session_id, file_path), daemon=True
-    ).start()
-
-    return jsonify({
-        "status":     "processing started",
-        "session_id": session_id,
-        "phone":      phone,
-        "tip":        "Watch dashboard — pending card will flip to URGENT"
-    }), 200
+    threading.Thread(target=process_recording, args=(session_id, file_path), daemon=True).start()
+    return jsonify({"status": "processing started", "session_id": session_id, "phone": phone}), 200
 
 
-# ── TEST: remote URL ──────────────────────────────────────────
-@app.route("/test/url", methods=["GET"])
-def test_url():
-    from translator import process_recording
-    audio_url  = request.args.get(
-        "url",
-        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
-    )
-    session_id = f"url_test_{datetime.datetime.utcnow().strftime('%H%M%S')}"
-    Log.info(f"Test URL  session={session_id}  url={audio_url[:60]}")
-    threading.Thread(
-        target=process_recording, args=(session_id, audio_url), daemon=True
-    ).start()
-    return jsonify({
-        "status": "processing started",
-        "session_id": session_id,
-        "url": audio_url
-    }), 200
-
-
-# ── TEST: specific file by name ───────────────────────────────
-@app.route("/test/file/<filename>", methods=["GET"])
-def test_file(filename):
-    from translator import process_recording
-    session_id = f"local_test_{datetime.datetime.utcnow().strftime('%H%M%S')}"
-    file_path  = os.path.join(os.getcwd(), "recordings", filename)
-
-    if not os.path.exists(file_path):
-        available = [
-            f for f in os.listdir("recordings")
-            if f.endswith(".wav") and "_clean" not in f
-        ]
-        return jsonify({"error": f"{filename} not found", "available": available}), 404
-
-    Log.info(f"Test file  session={session_id[-8:]}  file={filename}")
-    threading.Thread(
-        target=process_recording, args=(session_id, file_path), daemon=True
-    ).start()
-    return jsonify({
-        "status": "processing started",
-        "file": filename,
-        "session_id": session_id
-    }), 200
-
-
-# ── Co-Pilot API ─────────────────────────────────────────────
+# ── Co-Pilot API ──────────────────────────────────────────────
 @app.route("/api/copilot", methods=["POST"])
 def copilot_api():
     from copilot import get_copilot_response
     data  = request.get_json()
-    query = (data.get("query") or data.get("question","")).strip()
+    query = (data.get("query") or data.get("question", "")).strip()
     if not query:
         return jsonify({"error": "query required"}), 400
     result = get_copilot_response(query)
@@ -444,8 +404,6 @@ def copilot_api():
 
 @app.route("/api/copilot/audio/<filename>")
 def copilot_audio(filename):
-    import re
-    # Sanitise filename — only allow safe characters
     if not re.match(r'^copilot_\d+\.mp3$', filename):
         return jsonify({"error": "invalid"}), 400
     path = f"/tmp/{filename}"
@@ -458,12 +416,13 @@ def copilot_audio(filename):
 @app.route("/", methods=["GET", "POST"])
 def health():
     if request.method == "POST" and request.form.get("sessionId"):
-        Log.info("AT posted to / — redirecting to USSD handler")
+        Log.info("AT posted to / — redirecting to USSD")
         return ussd()
     return jsonify({
         "status":    "Kingolik running",
         "service":   "*384*67660#",
-        "dashboard": "/dashboard"
+        "dashboard": "/dashboard",
+        "analytics": "/analytics"
     }), 200
 
 
@@ -472,16 +431,16 @@ def health():
 def on_connect():
     Log.ok("Dashboard connected via WebSocket")
 
+
 @socketio.on("disconnect")
 def on_disconnect():
     Log.info("Dashboard disconnected")
 
+
+# ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-
-    socketio.run(
-        app,
-        host="0.0.0.0",   # VERY IMPORTANT
-        port=port,        # VERY IMPORTANT
-        debug=False
-    )
+    Log.section("Kingolik NGO Voice Bridge")
+    Log.ok(f"Starting on port {port}")
+    Log.divider()
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)

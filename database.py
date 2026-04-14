@@ -102,7 +102,11 @@ def save_translation(session_id: str, result: dict):
 
     # ── Trend detection — field pilot logistics engine ───────────
     try:
-        from trend_engine import check_trends, send_trend_sms
+        import importlib.util, sys
+        if importlib.util.find_spec("trend_engine") or "trend_engine" in sys.modules:
+            from trend_engine import check_trends, send_trend_sms
+        else:
+            raise ImportError("trend_engine.py not in project folder")
         session  = get_session(session_id)
         alerts   = check_trends(session or {}, result)
         if alerts:
@@ -222,6 +226,9 @@ def mark_handled(session_id: str):
     try:
         session = get_session(session_id)
         if session:
+            import importlib.util
+            if not importlib.util.find_spec("trend_engine"):
+                raise ImportError("trend_engine not installed")
             from trend_engine import send_feedback_to_caller
             send_feedback_to_caller(
                 session_id=session_id,
