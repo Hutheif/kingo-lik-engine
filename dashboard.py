@@ -1552,3 +1552,12 @@ async function askCopilot(queryOverride){
 }
 </script>
 </body></html>"""
+
+
+@dashboard_bp.route("/voice", methods=["POST"])
+def voice_callback():
+    return jsonify({"ok": True})
+
+@dashboard_bp.route("/voice/save", methods=["POST"])
+def voice_save_callback():
+    return jsonify({"ok": True})
