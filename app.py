@@ -105,7 +105,7 @@ else:
 # ══════════════════════════════════════════════════════════════
 _rate_store = defaultdict(list)
 _rate_lock  = threading.Lock()
-RATE_LIMIT  = 5
+RATE_LIMIT  = 999
 RATE_WINDOW = 3600
 
 
