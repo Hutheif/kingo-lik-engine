@@ -10,3 +10,6 @@ deep-translator
 python-dotenv
 requests
 groq
+eventlet
+flask-socketio
+gunicorn

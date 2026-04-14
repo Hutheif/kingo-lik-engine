@@ -1,4 +1,7 @@
-# app.py — King'olik NGO Voice Bridge
+import eventlet
+eventlet.monkey_patch()
+
+# NOW all other imports follow
 from flask_socketio import SocketIO
 from flask import Flask, request, make_response, jsonify, send_file
 import africastalking
@@ -8,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app      = Flask(__name__)
+# The async_mode must stay as 'eventlet' to match your Gunicorn command
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ── Register dashboard blueprint ──────────────────────────────
