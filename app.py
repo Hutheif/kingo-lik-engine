@@ -455,9 +455,10 @@ def health():
         return ussd()
     return jsonify({
         "status":    "Kingolik running",
-        "service":   "*384*67660#",
+        "service":   " *789*1990#",
         "dashboard": "/dashboard",
-        "analytics": "/analytics"
+        "analytics": "/analytics",
+        "voice_bridge": "+254711082547"
     }), 200
 
 
