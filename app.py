@@ -109,8 +109,8 @@ else:
 # ══════════════════════════════════════════════════════════════
 _rate_store = defaultdict(list)
 _rate_lock  = threading.Lock()
-RATE_LIMIT  = 
-RATE_WINDOW = 
+RATE_LIMIT  = 999
+RATE_WINDOW = 3600 # 1 hour in seconds
 
 
 def _is_rate_limited(phone: str) -> bool:
@@ -242,8 +242,8 @@ def trigger_voice_callback(phone_number: str, session_id: str):
     Waits 10 seconds then initiates outbound call from
     YOUR_NUMBER to phone_number via AT Voice API.
     """
-    Log.info(f"Callback scheduled  [...{session_id[-8:]}]  phone={phone_number}  wait=10s")
-    time.sleep(10)  # ← reduced from 30s to 10s
+    Log.info(f"Callback scheduled  [...{session_id[-8:]}]  phone={phone_number}  wait=5s")
+    time.sleep(5)  # ← reduced from 30s to 5s
 
     if not voice_service:
         Log.warn("voice_service not initialized — falling back to test audio")
@@ -308,77 +308,102 @@ def _run_translation(session_id: str, file_path: str, phone_number: str):
 #  User flashes your number → system calls them back FREE
 #  Endpoint: set as "Voice callback URL" in AT dashboard
 # ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+#  Flash-to-callback & Outbound Answer Handler
+# ══════════════════════════════════════════════════════════════
 @app.route("/voice", methods=["POST", "GET"])
 def voice_callback():
     """
     AT calls this when someone calls +254711082547.
-    We REJECT the incoming call (caller charged KES 0.00)
-    then call them back via trigger_voice_callback.
+    - Inbound: We REJECT (KES 0.00 charge) and start callback thread.
+    - Outbound: We SPEAK the greeting and RECORD the report.
     """
     caller_number = (
         request.form.get("callerNumber") or
         request.values.get("callerNumber") or
         request.args.get("callerNumber")
     )
-    is_active = (
-        request.form.get("isActive") or
-        request.values.get("isActive", "1")
-    )
+    is_active = request.values.get("isActive", "1")
+    
+    # Africa's Talking tells us if this is the user calling us or us calling them
+    direction = request.values.get("direction", "inbound")
+    
     session_id = (
         request.form.get("sessionId") or
         request.values.get("sessionId") or
         f"flash_{datetime.datetime.utcnow().strftime('%H%M%S')}"
     )
 
-    Log.info(f"Voice callback  caller={caller_number}  isActive={is_active}")
+    Log.info(f"Voice callback: caller={caller_number}, direction={direction}, isActive={is_active}")
 
     if not caller_number:
-        # No caller info — return silence XML
         return _reject_xml()
 
     if ALLOWED_PHONES and caller_number not in ALLOWED_PHONES:
         Log.warn(f"Blocked voice from {caller_number}")
         return _reject_xml()
 
-    if is_active == "1" and _is_rate_limited(caller_number):
-        Log.warn(f"Rate limit: {caller_number}")
+    # ─── CASE A: INCOMING FLASH (The User triggers the system) ───
+    if direction == "inbound":
+        if is_active == "1" and _is_rate_limited(caller_number):
+            Log.warn(f"Rate limit hit for {caller_number}")
+            return _reject_xml()
+
+        if is_active == "1":
+            from database import save_session
+            save_session({
+                "session_id": session_id,
+                "phone":       caller_number,
+                "menu_choice": "flash",
+                "timestamp":   datetime.datetime.utcnow().isoformat(),
+                "status":      "pending_call"
+            })
+            Log.ok(f"Flash received from {caller_number} — triggering callback thread.")
+
+            threading.Thread(
+                target=trigger_voice_callback,
+                args=(caller_number, session_id),
+                daemon=True
+            ).start()
+
+        # Reject the inbound call to keep it FREE for the user
         return _reject_xml()
 
-    if is_active == "1":
-        # Save a pending session for this flash call
-        from database import save_session
-        save_session({
-            "session_id": session_id,
-            "phone":       caller_number,
-            "menu_choice": "flash",
-            "timestamp":   datetime.datetime.utcnow().isoformat(),
-            "status":      "pending_call"
-        })
-        Log.ok(f"Flash received from {caller_number} — initiating callback in 10s")
-
-        threading.Thread(
-            target=trigger_voice_callback,
-            args=(caller_number, session_id),
-            daemon=True
-        ).start()
-
-    # Always reject the incoming call — user is charged KES 0.00
-    return _reject_xml()
-
-
-def _reject_xml():
-    xml = '<?xml version="1.0" encoding="UTF-8"?><Response><Reject/></Response>'
-    resp = make_response(xml, 200)
-    resp.headers["Content-Type"] = "application/xml"
-    return resp
-
+    # ─── CASE B: OUTGOING CALLBACK (The User answers our call) ───
+    else:
+        Log.info(f"Outgoing callback answered by {caller_number}. Serving XML...")
+        base_url = os.environ.get("BASE_URL", "https://kingo-lik-engine.onrender.com")
+        
+        # This XML greets the user and records their voice. 
+        # Note: it sends the final mp3 to /voice/save
+        xml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="woman" playBeep="true">
+        Habari. Karibu. Mfumo wa habari wa King-olik.
+        Ombi lako la kusaidia limepokelewa.
+        Tafadhali sema ujumbe wako baada ya mlio.
+        Bonyeza nyota ukimaliza.
+    </Say>
+    <Record 
+        finishOnKey="*" 
+        maxLength="120" 
+        trimSilence="true" 
+        playBeep="true" 
+        callbackUrl="{base_url}/voice/save?session_id={session_id}" 
+    />
+</Response>'''
+        
+        resp = make_response(xml_response, 200)
+        resp.headers["Content-Type"] = "application/xml"
+        return resp
 
 # ══════════════════════════════════════════════════════════════
 #  Voice recording webhook
 #  AT calls this after the user records their message
 #  This is the URL in your <Record callbackUrl="..."/>
 # ══════════════════════════════════════════════════════════════
-@app.route("/voice/record", methods=["POST", "GET"])
+@app.route("/voice/save", methods=["POST", "GET"])
 def voice_record():
     from database import update_call_record
     from translator import process_recording
