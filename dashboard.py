@@ -1136,6 +1136,26 @@ ANALYTICS_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Screen edge glow — animates on voice activity -->
+<div id="edge-glow" style="
+  position:fixed;inset:0;pointer-events:none;z-index:9999;
+  opacity:0;transition:opacity 0.4s ease;
+  background:
+    linear-gradient(90deg, rgba(74,222,128,0.18) 0%, transparent 6%, transparent 94%, rgba(74,222,128,0.18) 100%),
+    linear-gradient(0deg,  rgba(74,222,128,0.18) 0%, transparent 6%, transparent 94%, rgba(74,222,128,0.18) 100%);
+  border-radius:0;
+"></div>
+
+<!-- Animated gradient border following screen path -->
+<canvas id="edge-canvas" style="
+  position:fixed;inset:0;pointer-events:none;z-index:9998;
+  opacity:0;transition:opacity 0.4s ease;
+  width:100vw;height:100vh;
+"></canvas>
+
+<div id="edge-glow" style="position:fixed;inset:0;pointer-events:none;z-index:9999;opacity:0;transition:opacity 0.4s ease;background:linear-gradient(90deg,rgba(74,222,128,0.15) 0%,transparent 5%,transparent 95%,rgba(74,222,128,0.15) 100%),linear-gradient(0deg,rgba(74,222,128,0.15) 0%,transparent 5%,transparent 95%,rgba(74,222,128,0.15) 100%)"></div>
+<canvas id="edge-canvas" style="position:fixed;inset:0;pointer-events:none;z-index:9998;opacity:0;transition:opacity 0.4s ease"></canvas>
+
 <div class="footer-bar">Kingolik NGO Voice Bridge · Live deployment · kingo-lik-engine.onrender.com</div>
 
 <script>
@@ -1403,5 +1423,132 @@ if('speechSynthesis' in window){
 //   r.onend=()=>r.start(); r.start();
 // }
 // startWakeWord(); // ← uncomment on May 19
+
+// ══════════════════════════════════════════════════════════════
+//  SCREEN EDGE GLOW — syncs with voice activity
+//  Animated gradient border follows screen path
+//  Triggers on TTS start · Fades on TTS end
+// ══════════════════════════════════════════════════════════════
+const edgeGlow   = document.getElementById('edge-glow');
+const edgeCanvas = document.getElementById('edge-canvas');
+let glowCtx, glowAnimId, glowOffset=0, glowActive=false;
+
+function initGlowCanvas(){
+  edgeCanvas.width  = window.innerWidth;
+  edgeCanvas.height = window.innerHeight;
+  glowCtx = edgeCanvas.getContext('2d');
+}
+
+function drawGlowBorder(offset){
+  if(!glowCtx) return;
+  const W=edgeCanvas.width, H=edgeCanvas.height;
+  glowCtx.clearRect(0,0,W,H);
+  const perim  = 2*(W+H);
+  const segLen = perim * 0.35;
+  const pos    = ((offset % perim) + perim) % perim;
+  const segs   = [
+    {x1:0,y1:0,x2:W,y2:0,len:W},
+    {x1:W,y1:0,x2:W,y2:H,len:H},
+    {x1:W,y1:H,x2:0,y2:H,len:W},
+    {x1:0,y1:H,x2:0,y2:0,len:H},
+  ];
+  glowCtx.lineWidth=3; glowCtx.shadowBlur=20; glowCtx.shadowColor='#4ade80';
+  let travelled=0;
+  for(const seg of segs){
+    const mid=(travelled+travelled+seg.len)/2;
+    const glowEnd=(pos+segLen)%perim;
+    let dist=0;
+    if(glowEnd>pos){ dist=(mid>=pos&&mid<=glowEnd)?Math.min(mid-pos,glowEnd-mid)/(segLen/2):0; }
+    else { dist=(mid>=pos||mid<=glowEnd)?0.7:0; }
+    if(dist>0.05){
+      const a=Math.min(dist*0.95,0.95);
+      const h1=(offset*0.5)%360, h2=(h1+140)%360;
+      const g=glowCtx.createLinearGradient(seg.x1,seg.y1,seg.x2,seg.y2);
+      g.addColorStop(0,   `hsla(${h1},100%,65%,0)`);
+      g.addColorStop(0.35,`hsla(${h1},100%,65%,${a})`);
+      g.addColorStop(0.65,`hsla(${h2},100%,65%,${a})`);
+      g.addColorStop(1,   `hsla(${h2},100%,65%,0)`);
+      glowCtx.strokeStyle=g;
+      glowCtx.beginPath(); glowCtx.moveTo(seg.x1,seg.y1); glowCtx.lineTo(seg.x2,seg.y2); glowCtx.stroke();
+    }
+    travelled+=seg.len;
+  }
+}
+
+function startGlow(){
+  if(glowActive) return;
+  glowActive=true; initGlowCanvas();
+  edgeGlow.style.opacity='1'; edgeCanvas.style.opacity='1';
+  function animate(){ if(!glowActive)return; glowOffset+=4; drawGlowBorder(glowOffset); glowAnimId=requestAnimationFrame(animate); }
+  animate();
+}
+
+function stopGlow(){
+  glowActive=false; cancelAnimationFrame(glowAnimId);
+  edgeGlow.style.opacity='0'; edgeCanvas.style.opacity='0';
+  setTimeout(()=>{ glowCtx?.clearRect(0,0,edgeCanvas.width,edgeCanvas.height); },500);
+}
+
+window.addEventListener('resize',()=>{ if(glowActive) initGlowCanvas(); });
+
+// ── Override cpSpeak — sync glow + Gemini-like typewriter ───
+function cpSpeak(text){
+  if(!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);
+  u.rate=0.92; u.pitch=0.9; u.lang='en-GB';
+  const voices=speechSynthesis.getVoices();
+  const pref=voices.find(v=>v.name.includes('Daniel')||v.name.includes('Aaron')||v.name.includes('Google UK'));
+  if(pref) u.voice=pref;
+  u.onstart=()=>{ startGlow(); document.getElementById('cp-waveform').classList.add('active'); };
+  u.onend  =()=>{ stopGlow();  document.getElementById('cp-waveform').classList.remove('active'); };
+  u.onerror=()=>{ stopGlow();  document.getElementById('cp-waveform').classList.remove('active'); };
+  speechSynthesis.speak(u);
+}
+
+// Gemini-like typewriter — types characters one by one before speaking
+function cpTypeWriter(el, text, onDone){
+  el.textContent=''; let i=0;
+  const iv=setInterval(()=>{
+    el.textContent+=text[i++];
+    if(i>=text.length){ clearInterval(iv); if(onDone) onDone(); }
+  },16);
+}
+
+// Override askCopilot with typewriter + glow
+async function askCopilot(queryOverride){
+  const input=document.getElementById('cp-input');
+  const q=(queryOverride||input.value).trim();
+  if(!q) return;
+  cpAddMsg(q,true); input.value=''; cpAddThinking();
+  try{
+    const resp=await fetch('/api/copilot',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({query:q,hours:currentDays*24})});
+    document.getElementById('cp-thinking')?.remove();
+    const data=await resp.json();
+    const text=data.text||data.answer||'No response.';
+
+    // Build message with typewriter target
+    const msgs=document.getElementById('cp-messages');
+    const d=document.createElement('div'); d.className='cp-msg';
+    d.innerHTML='<div class="cp-av bot">K</div><div class="cp-text" id="cp-tw"></div>';
+    msgs.appendChild(d); msgs.scrollTop=msgs.scrollHeight;
+    const twEl=document.getElementById('cp-tw'); twEl.removeAttribute('id');
+
+    // Type it out then speak — Gemini-style
+    cpTypeWriter(twEl, text, ()=>{ cpSpeak(text); });
+
+    const modeEl=document.getElementById('cp-mode');
+    if(modeEl){
+      const m=data.mode||'';
+      modeEl.textContent=m==='groq'?'Groq · Llama 3 · Online':m==='offline'?'Offline · SQL fallback':m==='anthropic'?'Claude · Online':'Ready';
+    }
+  } catch(e){
+    document.getElementById('cp-thinking')?.remove();
+    const t='[Offline] Cannot reach server. Check your connection.';
+    cpAddMsg(t,false); cpSpeak(t);
+  }
+}
 </script>
 </body></html>"""
