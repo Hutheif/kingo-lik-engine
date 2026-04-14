@@ -60,6 +60,37 @@ def voice_callback():
 
     return ""
 
+# ── SMS / Please-Call-Me Trigger ──────────────────────────────
+@app.route("/sms", methods=['POST'])
+def sms_callback():
+    # 1. Get the data from the incoming SMS
+    # For a 'Please Call Me', 'from' is the person who dialed *130*
+    sender = request.values.get("from")
+    text   = request.values.get("text")
+
+    Log.info(f"SMS Received from {sender}: '{text}'")
+
+    # 2. Security & Rate Limit Checks
+    if ALLOWED_PHONES and sender not in ALLOWED_PHONES:
+        Log.warn(f"Ignored SMS from unauthorized number: {sender}")
+        return "", 200
+
+    if _is_rate_limited(sender):
+        Log.warn(f"Rate limit hit for SMS trigger: {sender}")
+        return "", 200
+
+    # 3. Trigger the AI Callback
+    if voice_service:
+        try:
+            Log.info(f"Triggering 'Please Call Me' response for {sender}...")
+            # We call them back from your virtual number
+            voice_service.call("+254711082547", [sender])
+            Log.ok(f"AI Callback initiated via SMS trigger for {sender}")
+        except Exception as e:
+            Log.error(f"Failed to trigger voice from SMS: {str(e)}")
+
+    return "", 200
+
 
 # ── Phone whitelist — cost protection ─────────────────────────
 # Set ALLOWED_PHONES=+254700000001,+254700000002 in .env
