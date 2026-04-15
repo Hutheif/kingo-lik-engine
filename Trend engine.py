@@ -1,160 +1,112 @@
-# trend_engine.py — Field Pilot Logistics Engine
-#
-# Inspired by aviation dispatch: predict problems before they become crises.
-# If 3 people mention "dry wells" in 4 hours from the same area, trigger alert.
-# This is what separates King'olik from a recording system.
+# trend_engine.py — King'olik Trend Detection Engine
+# Detects if 3+ sessions mention the same crisis keyword within 4 hours
+# then fires an SMS alert to the logistics coordinator.
 
-import os, json, threading, datetime
+import os, datetime
 from collections import defaultdict
 
-# ── Trend thresholds ───────────────────────────────────────────
-TREND_WINDOW_HOURS = 4      # look back this many hours
-TREND_THRESHOLD    = 3      # this many reports triggers an alert
-FEEDBACK_DELAY_SEC = 5      # seconds before sending "help is on the way" SMS
+_trend_memory: dict = defaultdict(list)  # keyword → [timestamps]
 
-# ── Trend topic clusters ───────────────────────────────────────
-# Keywords that belong to the same logistics problem
 TREND_CLUSTERS = {
-    "water_crisis": [
-        "water","maji","ngakipi","biyo","drought","ukame","dry","well","borehole",
-        "thirst","no water","maji hakuna","biyo ma jiro","ngadikipi"
-    ],
-    "food_shortage": [
-        "food","chakula","njaa","hunger","famine","starvation","kimuj",
-        "starving","no food","chakula hakuna","gaajo","adyokiring"
-    ],
-    "security_threat": [
-        "attack","violence","armed","soldiers","militia","gun","bunduki",
-        "shambulio","weerar","raid","shooting","danger","hatari","khatar"
-    ],
-    "medical_emergency": [
-        "injured","bleeding","damu","jeraha","hospital","hospitali","doctor",
-        "daktari","nabar","dead","dying","unconscious","ambulance","sick"
-    ],
-    "fire": [
-        "fire","moto","mach","dab","flames","burning","inawaka","mwaki",
-        "haraka","big fire","moto mkubwa","mach maduong"
-    ],
-    "displacement": [
-        "displaced","flood","mafuriko","collapsed","homeless","tent","hema",
-        "shelter","makazi","no shelter","barakacay","qaxooti"
-    ]
+    "water_crisis":   ["maji","water","akwap","drought","dry well","mam akwap","ngakipi"],
+    "food_crisis":    ["chakula","food","njaa","hunger","famine","kech","gaajo"],
+    "medical":        ["mgonjwa","sick","daktari","hospital","jeraha","injury","damu","blood"],
+    "security":       ["vita","violence","shambulio","attack","weerar","gunshot","bunduki"],
+    "fire":           ["moto","fire","inawaka","mac","dab","mach"],
+    "missing_person": ["kupotea","missing","mafuriko","lunaystay","mtoto","child"],
 }
 
+CLUSTER_THRESHOLD = 3
+CLUSTER_WINDOW_H  = 4
 
-def check_trends(new_session: dict, new_result: dict) -> list:
+
+def check_trends(session: dict, result: dict) -> list:
     """
-    Called after every translation. Checks if this report creates a trend.
-    Returns list of alert dicts if thresholds are exceeded.
+    Called after each translation.
+    Returns list of trend alert dicts if any cluster threshold is hit.
     """
-    alerts = []
-    try:
-        from database import get_all_sessions
-        sessions  = get_all_sessions()
-        cutoff    = datetime.datetime.utcnow() - datetime.timedelta(hours=TREND_WINDOW_HOURS)
-        recent    = []
-        for s in sessions:
-            try:
-                if datetime.datetime.fromisoformat(s.get("timestamp","")) >= cutoff:
-                    recent.append(s)
-            except Exception:
-                pass
+    text = " ".join(filter(None, [
+        result.get("translation",""),
+        result.get("transcript",""),
+        " ".join(result.get("urgent_keywords") or [])
+    ])).lower()
 
-        # Count keyword hits per cluster across recent sessions
-        cluster_hits = defaultdict(list)
-        for s in recent:
-            t    = s.get("translation") or {}
-            text = " ".join(filter(None, [
-                t.get("translation",""), t.get("transcript",""),
-                " ".join(t.get("urgent_keywords") or [])
-            ])).lower()
-            for cluster, keywords in TREND_CLUSTERS.items():
-                for kw in keywords:
-                    if kw in text:
-                        cluster_hits[cluster].append(s.get("session_id",""))
-                        break  # one hit per session per cluster
+    now     = datetime.datetime.utcnow()
+    cutoff  = now - datetime.timedelta(hours=CLUSTER_WINDOW_H)
+    alerts  = []
 
-        # Check thresholds
-        for cluster, session_ids in cluster_hits.items():
-            unique_sessions = list(set(session_ids))
-            if len(unique_sessions) >= TREND_THRESHOLD:
-                alert = {
-                    "type":          "trend_alert",
-                    "cluster":       cluster,
-                    "count":         len(unique_sessions),
-                    "window_hours":  TREND_WINDOW_HOURS,
-                    "threshold":     TREND_THRESHOLD,
-                    "triggered_at":  datetime.datetime.utcnow().isoformat(),
-                    "sessions":      unique_sessions[-5:],  # last 5 session IDs
-                    "message":       _format_alert_message(cluster, len(unique_sessions))
-                }
-                alerts.append(alert)
-                print(f"[TREND] ALERT: {cluster} — {len(unique_sessions)} reports "
-                      f"in {TREND_WINDOW_HOURS}h (threshold: {TREND_THRESHOLD})")
+    for cluster_name, keywords in TREND_CLUSTERS.items():
+        if any(kw in text for kw in keywords):
+            # Add this session's timestamp to the cluster
+            _trend_memory[cluster_name].append({
+                "ts":    now,
+                "phone": session.get("phone","?"),
+                "sid":   session.get("session_id","?")[-8:]
+            })
 
-    except Exception as e:
-        print(f"[TREND] Check failed: {e}")
+        # Prune old entries
+        _trend_memory[cluster_name] = [
+            e for e in _trend_memory[cluster_name]
+            if e["ts"] >= cutoff
+        ]
+
+        count = len(_trend_memory[cluster_name])
+        if count >= CLUSTER_THRESHOLD:
+            phones = list(set(e["phone"] for e in _trend_memory[cluster_name]))
+            alerts.append({
+                "cluster":   cluster_name,
+                "count":     count,
+                "phones":    phones[:3],
+                "message":   f"TREND ALERT: {cluster_name.replace('_',' ').upper()} — {count} reports in {CLUSTER_WINDOW_H}h from {', '.join(phones[:3])}"
+            })
+            # Reset to avoid repeated alerts for same cluster
+            _trend_memory[cluster_name] = []
 
     return alerts
 
 
-def _format_alert_message(cluster: str, count: int) -> str:
-    messages = {
-        "water_crisis":      f"LOGISTICS ALERT: {count} reports of water shortage in {TREND_WINDOW_HOURS}h. Dispatch water truck.",
-        "food_shortage":     f"LOGISTICS ALERT: {count} reports of food shortage in {TREND_WINDOW_HOURS}h. Notify food distribution.",
-        "security_threat":   f"SECURITY ALERT: {count} security incidents reported in {TREND_WINDOW_HOURS}h. Notify protection cluster.",
-        "medical_emergency": f"MEDICAL ALERT: {count} medical emergencies in {TREND_WINDOW_HOURS}h. Deploy health team.",
-        "fire":              f"FIRE ALERT: {count} fire reports in {TREND_WINDOW_HOURS}h. Dispatch emergency response.",
-        "displacement":      f"DISPLACEMENT ALERT: {count} displacement reports in {TREND_WINDOW_HOURS}h. Notify shelter cluster.",
-    }
-    return messages.get(cluster, f"TREND ALERT: {count} related reports in {TREND_WINDOW_HOURS}h.")
-
-
 def send_trend_sms(alerts: list):
-    """Sends SMS to alert number for each triggered trend. Runs in background thread."""
-    alert_number = os.environ.get("ALERT_PHONE","")
-    if not alert_number or not alerts:
+    """Sends logistics SMS for each trend alert."""
+    coordinator = os.environ.get("LOGISTICS_PHONE") or os.environ.get("DUTY_OFFICER_PHONE","")
+    if not coordinator:
+        print("[TREND] No LOGISTICS_PHONE set — alert not sent")
         return
 
-    def _send():
-        try:
-            import africastalking
-            sms = africastalking.SMS
-            for alert in alerts:
-                msg = f"KINGOLIK TREND ALERT\n{alert['message']}\nTime: {alert['triggered_at'][:16]}"
-                resp = sms.send(msg, [alert_number], sender_id=None)
-                print(f"[TREND SMS] Sent: {alert['cluster']}  resp={resp}")
-        except Exception as e:
-            print(f"[TREND SMS] Failed: {e}")
-
-    threading.Thread(target=_send, daemon=True).start()
+    try:
+        import africastalking
+        sms = africastalking.SMS
+        for alert in alerts:
+            msg = (
+                f"KINGOLIK TREND ALERT\n"
+                f"Crisis: {alert['cluster'].replace('_',' ')}\n"
+                f"Reports: {alert['count']} in last {CLUSTER_WINDOW_H}h\n"
+                f"Callers: {', '.join(alert['phones'])}\n"
+                f"Action: Dispatch resources immediately"
+            )
+            resp = sms.send(message=msg, recipients=[coordinator])
+            print(f"[TREND] SMS sent  cluster={alert['cluster']}  resp={resp}")
+    except Exception as e:
+        print(f"[TREND] SMS failed: {e}")
 
 
 def send_feedback_to_caller(session_id: str, phone: str, eta_hours: int = 2):
     """
-    Sends 'help is on the way' SMS back to the original caller
-    when a caseworker marks a session as handled.
-    This closes the loop and builds trust with the community.
+    Sends confirmation SMS to original caller when case is marked as handled.
+    Called from database.mark_handled().
     """
-    if not phone or phone in ("unknown", "local-test"):
+    if not phone or phone in ("unknown","local-test",""):
         return
 
-    def _send():
-        try:
-            import africastalking
-            sms = africastalking.SMS
-            message = (
-                f"Habari / Hello.\n"
-                f"King'olik: Your report has been received and is being handled.\n"
-                f"Msaada unakuja. Help is on the way.\n"
-                f"Expected within {eta_hours} hours.\n"
-                f"Ref: ...{session_id[-6:]}"
-            )
-            resp = sms.send(message, [phone], sender_id=None)
-            recipients = resp.get("SMSMessageData",{}).get("Recipients",[])
-            status = recipients[0].get("status","?") if recipients else "?"
-            print(f"[FEEDBACK SMS] Sent to caller {phone}  status={status}")
-        except Exception as e:
-            print(f"[FEEDBACK SMS] Failed: {e}")
-
-    threading.Thread(target=_send, daemon=True).start()
+    try:
+        import africastalking
+        sms = africastalking.SMS
+        msg = (
+            f"King'olik: Ombi lako limepokelewa.\n"
+            f"Msaada unakuja. Muda wa kuwasili: saa {eta_hours}.\n"
+            f"Your report was received. Help is on the way. ETA: {eta_hours} hours.\n"
+            f"Ref: {session_id[-8:]}"
+        )
+        resp = sms.send(message=msg, recipients=[phone])
+        print(f"[FEEDBACK] SMS sent to {phone}  resp={resp}")
+    except Exception as e:
+        print(f"[FEEDBACK] SMS failed: {e}")
