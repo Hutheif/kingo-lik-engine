@@ -1554,14 +1554,3 @@ async function askCopilot(queryOverride){
 </body></html>"""
 
 
-@dashboard_bp.route("/voice", methods=["POST"])
-def voice_callback():
-    return jsonify({"ok": True})
-
-@dashboard_bp.route("/voice/save", methods=["POST"])
-def voice_save_callback():
-    return jsonify({"ok": True})
-
-@dashboard_bp.route("/voice/flash", methods=["POST"])
-def voice_flash_callback():
-    return jsonify({"ok": True})
