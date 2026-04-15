@@ -277,14 +277,22 @@ def trigger_voice_callback(phone_number: str, session_id: str):
     Log.info(f"Registered pending  {phone_number} → {session_id[-8:]}")
 
     try:
-        resp    = voice_service.call(callFrom=YOUR_NUMBER, callTo=[phone_number])
+        # IMPORTANT: NO callbackUrl here for AT Voice call
+        # AT uses your /voice/answer webhook instead
+        resp = voice_service.call(
+            callFrom=YOUR_NUMBER,
+            callTo=[phone_number]
+        )
+
         entries = resp.get("entries", [])
-        status  = entries[0].get("status","?") if entries else "no_entries"
+        status = entries[0].get("status", "?") if entries else "no_entries"
+
         Log.ok(f"Call placed  status={status}  phone={phone_number}")
 
-        if status not in ("Queued","Ringing","Success"):
-            Log.warn(f"Unexpected status '{status}' — test fallback")
+        if status not in ("Queued", "Ringing", "Success"):
+            Log.warn(f"Unexpected status '{status}' — triggering fallback")
             _fallback(phone_number, session_id)
+
     except Exception as e:
         Log.error(f"voice.call failed: {e}")
         _fallback(phone_number, session_id)
@@ -364,37 +372,36 @@ def voice_flash():
 # ══════════════════════════════════════════════════════════════
 @app.route("/voice/answer", methods=["POST", "GET"])
 def voice_answer():
-    """Served when our OUTBOUND call is answered. Returns greeting + Record XML."""
-    # AT may send callerNumber as the number we called, or as YOUR_NUMBER
-    # directional info varies — we check both
-    caller      = (request.form.get("callerNumber") or
-                   request.values.get("callerNumber") or "").strip()
-    destination = (request.form.get("destinationNumber") or
-                   request.values.get("destinationNumber") or "").strip()
-    call_state  = (request.form.get("callSessionState") or
-                   request.values.get("callSessionState") or "").lower()
-    session_id  = (request.args.get("session_id") or
-                   request.values.get("sessionId") or "")
+    """IVR entry point for outbound call answer"""
+
+    caller = (request.values.get("callerNumber") or "").strip()
+    destination = (request.values.get("destinationNumber") or "").strip()
+    call_state = (request.values.get("callSessionState") or "").lower()
+    session_id = (request.values.get("sessionId") or request.args.get("session_id") or "").strip()
 
     Log.info(
-        f"Voice answer  caller={caller}  dest={destination}"
-        f"  state={call_state}  session=[...{(session_id or '?')[-8:]}]"
+        f"Voice answer caller={caller} dest={destination} state={call_state} session={session_id}"
     )
 
-    # Find the session_id — either passed in URL or looked up from pending calls
+    # 🔥 SAFE SESSION RESOLUTION (IMPORTANT FIX)
     if not session_id:
-        # The person we called is either in caller or destination
-        user_phone = destination if destination != YOUR_NUMBER else caller
-        session_id = _pending_calls.pop(user_phone, None) or \
-                     _pending_calls.pop(caller, None) or \
-                     f"answer_{datetime.datetime.utcnow().strftime('%H%M%S')}"
+        session_id = (
+            _pending_calls.pop(caller, None)
+            or _pending_calls.pop(destination, None)
+        )
 
-    Log.ok(f"Serving greeting  session=[...{session_id[-8:]}]")
+    if not session_id:
+        session_id = f"answer_{datetime.datetime.utcnow().strftime('%H%M%S%f')}"
 
-    xml  = xml_greeting(session_id)
-    resp = make_response(xml, 200)
-    resp.headers["Content-Type"] = "application/xml"
-    return resp
+    Log.ok(f"Serving IVR session={session_id}")
+
+    xml = xml_greeting(session_id)
+
+    response = make_response(xml)
+    response.headers["Content-Type"] = "application/xml"
+    response.headers["Cache-Control"] = "no-cache"
+
+    return response
 
 
 # ══════════════════════════════════════════════════════════════
