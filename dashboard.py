@@ -644,8 +644,9 @@ function updateStats(){
 function buildCardHTML(s){
   const t=s.translation||{}, status=getStatus(s), engine=t.engine||'';
   const keywords=t.urgent_keywords||[], sid=s.session_id;
-  const note=notesStore[sid]||s.note||'', audioUrl='/api/audio/'+sid;
+  const note=notesStore[sid]||s.note||'';
   const handled=status==='handled';
+
   return `<div class="card ${status}" data-session="${sid}">
     <div class="card-header">
       <div class="card-meta">
@@ -666,20 +667,25 @@ function buildCardHTML(s){
         <span class="timestamp">${timeAgo(s.timestamp)}</span>
       </div>
     </div>
+
     ${t.translation?`<div class="translation-block">
       <div class="tblock-label">English translation</div>
       <div class="tblock-text" data-role="translation-text">${t.translation}</div>
     </div>`:''}
+
     ${t.transcript&&t.transcript!==t.translation?`<div class="translation-block">
       <div class="tblock-label">Original (${t.detected_language||'detected'})</div>
       <div class="tblock-text original" data-role="transcript-text">${t.transcript}</div>
     </div>`:''}
+
     ${keywords.length>0?`<div class="urgent-keywords">
       ${keywords.map(k=>`<span class="kw-chip">${k}</span>`).join('')}
     </div>`:''}
+
     ${t.confidence?`<div style="font-size:11px;color:#9ca3af;margin-top:8px">
       Confidence: ${t.confidence}${s.duration?' · '+s.duration+'s':''}
       ${t.score?' · score: '+t.score:''}</div>`:''}
+
     ${(t.requires_review||t.confidence==='low')?`
     <div style="background:#fef3c7;border:0.5px solid #d97706;border-radius:6px;
                 padding:8px 12px;margin-top:8px;display:flex;align-items:center;gap:8px">
@@ -689,13 +695,27 @@ function buildCardHTML(s){
         <div style="font-size:11px;color:#b45309;margin-top:2px">${t.review_reason||'Low confidence — verify before dispatch'}</div>
       </div>
     </div>`:''}
+
+    <!-- 🔥 FIXED AUDIO SECTION -->
     <div class="audio-section">
       <div class="audio-label"><span class="audio-dot"></span>Voice recording</div>
-      <audio controls preload="none" style="width:100%;height:36px;border-radius:6px;accent-color:#1a1a1a"
-             onerror="this.parentElement.innerHTML='<span style=font-size:11px;color:#9ca3af>Audio unavailable</span>'">
-        <source src="${audioUrl}" type="audio/wav">
-      </audio>
+
+      ${t?.is_text_report ? `
+        <div style="font-size:11px;color:#9ca3af;padding:6px">
+          📝 Text report — no audio
+        </div>
+      ` : (s.audio_url ? `
+        <audio controls preload="none" style="width:100%;height:36px;border-radius:6px;accent-color:#1a1a1a"
+               onerror="this.parentElement.innerHTML='<span style=font-size:11px;color:#9ca3af>Audio unavailable</span>'">
+          <source src="${s.audio_url}" type="audio/wav">
+        </audio>
+      ` : `
+        <div style="font-size:11px;color:#9ca3af;padding:6px">
+          ⚠️ No audio available
+        </div>
+      `)}
     </div>
+
     ${!handled?`<div style="margin-top:12px;padding-top:10px;border-top:0.5px solid #f3f4f6">
       <div class="tblock-label">Caseworker notes</div>
       <textarea class="notes-area" id="note-${sid}"
@@ -706,6 +726,7 @@ function buildCardHTML(s){
         <button class="action-btn" onclick="markHandled('${sid}')">Mark as handled</button>
       </div>
     </div>
+
     <div style="margin-top:10px;padding-top:10px;border-top:0.5px solid #f3f4f6">
       <div class="tblock-label" style="display:flex;align-items:center;gap:6px">
         Corrected translation
