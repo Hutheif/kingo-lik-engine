@@ -8,59 +8,10 @@ load_dotenv()
 
 from google import genai
 from google.genai import types
-import os
-import re
-import json
-
-# Detect if we are running on Render or Railway
-IS_CLOUD = os.environ.get("RENDER") or os.environ.get("RAILWAY_ENVIRONMENT")
-
-def _scenario_b_local(audio_path: str, session_id: str) -> dict:
-    if IS_CLOUD:
-        # Skip the 1.5GB Whisper download on cloud; use Gemini/Groq instead
-        return _groq_fallback(audio_path, session_id)
-    
-    # Your existing Whisper code goes here for local dev
-    pass
-
-def _groq_fallback(audio_path: str, session_id: str) -> dict:
-    """Cloud fallback: Transcribes and translates using Gemini 2.0 Flash."""
-    try:
-        with open(audio_path, "rb") as f:
-            audio_bytes = f.read()
-        
-        from google import genai
-        from google.genai import types
-        
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        
-        response = client.models.generate_content(
-            model="gemini-2.0-flash", # Note: using 2.0 as 2.5 is not released yet
-            contents=[
-                types.Content(parts=[
-                    types.Part(text='Transcribe and translate to English. Return JSON: {"transcript":"","detected_language":"","translation":"","urgent_keywords":[],"confidence":"medium"}'),
-                    types.Part(inline_data=types.Blob(mime_type="audio/wav", data=audio_bytes))
-                ])
-            ]
-        )
-        
-        raw = re.sub(r"```json|```", "", response.text).strip()
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        return json.loads(match.group() if match else raw)
-        
-    except Exception as e:
-        return {
-            "transcript": "", 
-            "detected_language": "unknown",
-            "translation": f"Cloud transcription failed: {e}",
-            "urgent_keywords": [], 
-            "confidence": "none"
-        }
 
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 CLOUD_TIMEOUT = 30
-
 
 
 # ══════════════════════════════════════════════════════════════
@@ -368,8 +319,13 @@ def _scenario_a_cloud(audio_path: str, session_id: str) -> dict:
                     ))
                 ])]
             )
-            raw = re.sub(r"```json|```", "", response.text.strip()).strip()
-            result_box[0] = json.loads(raw)
+            # Strip markdown fences, leading/trailing whitespace, and BOM
+            raw = re.sub(r"```json|```", "", response.text or "").strip()
+            # Find the JSON object — handles leading newlines, text before {
+            match = re.search(r'{.*}', raw, re.DOTALL)
+            if not match:
+                raise ValueError(f"No JSON object in Gemini response: {raw[:100]}")
+            result_box[0] = json.loads(match.group())
         except Exception as e:
             error_box[0] = e
 
