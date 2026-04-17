@@ -1,12 +1,11 @@
-# database.py — SQLite backend + SMS urgent alert
+# database.py — King'olik SQLite backend
 import sqlite3, json, os, threading
 from datetime import datetime
 
 DB_PATH = "kingolik.db"
 _lock   = threading.Lock()
 
-# SMS alert config — caseworker number to notify on urgent keywords
-SMS_ALERT_NUMBER = os.environ.get("ALERT_PHONE", "")  # e.g. +254712345678
+SMS_ALERT_NUMBER = os.environ.get("ALERT_PHONE", "")
 
 
 def _conn():
@@ -15,6 +14,21 @@ def _conn():
     con.execute("PRAGMA foreign_keys=ON")
     con.row_factory = sqlite3.Row
     return con
+
+
+def _migrate():
+    """Add missing columns safely — runs on every startup."""
+    migrations = [
+        "ALTER TABLE sessions ADD COLUMN audio_url TEXT DEFAULT ''",
+        "ALTER TABLE sessions ADD COLUMN notes TEXT DEFAULT ''",
+    ]
+    with _conn() as con:
+        for sql in migrations:
+            try:
+                con.execute(sql)
+                con.commit()
+            except Exception:
+                pass  # column already exists
 
 
 def init_db():
@@ -28,15 +42,18 @@ def init_db():
                 status        TEXT DEFAULT 'pending_call',
                 source_wav    TEXT DEFAULT '',
                 recording_url TEXT DEFAULT '',
+                audio_url     TEXT DEFAULT '',
                 duration      TEXT DEFAULT '',
                 handled       INTEGER DEFAULT 0,
                 note          TEXT DEFAULT '',
+                notes         TEXT DEFAULT '',
                 correction    TEXT DEFAULT '',
                 translation   TEXT DEFAULT '',
                 created_at    TEXT DEFAULT (datetime('now'))
             )
         """)
         con.commit()
+    _migrate()
     print("[DB] SQLite ready →", DB_PATH)
 
 
@@ -47,11 +64,11 @@ def save_session(data: dict):
                 (session_id, phone, menu_choice, timestamp, status, source_wav)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
-                phone        = excluded.phone,
-                menu_choice  = excluded.menu_choice,
-                timestamp    = excluded.timestamp,
-                status       = excluded.status,
-                source_wav   = excluded.source_wav
+                phone       = excluded.phone,
+                menu_choice = excluded.menu_choice,
+                timestamp   = excluded.timestamp,
+                status      = excluded.status,
+                source_wav  = excluded.source_wav
         """, (
             data["session_id"],
             data.get("phone", ""),
@@ -73,24 +90,67 @@ def update_call_record(session_id: str, recording_url: str, duration: str):
         con.commit()
 
 
+def save_audio_url(session_id: str, audio_url: str):
+    """Saves the API path for the audio player."""
+    with _lock, _conn() as con:
+        con.execute(
+            "UPDATE sessions SET audio_url=? WHERE session_id=?",
+            (audio_url, session_id)
+        )
+        con.commit()
+    print(f"[DB] Audio URL saved → {session_id[-8:]}  url={audio_url}")
+
+
+def update_call_status(session_id: str, status: str):
+    """Updates status field only."""
+    with _lock, _conn() as con:
+        con.execute(
+            "UPDATE sessions SET status=? WHERE session_id=?",
+            (status, session_id)
+        )
+        con.commit()
+
+
 def save_translation(session_id: str, result: dict):
-    translation_json = json.dumps(result)
+    """
+    THE SINGLE AUTHORITATIVE save_translation.
+
+    Accepts result as a DICT (the standard format from translator.py).
+    Stores as JSON so dashboard can read result['translation'], result['transcript'] etc.
+
+    DO NOT add another save_translation() below — this is the only one.
+    """
+    # Guard: skip if already translated to prevent duplicate processing
+    current = get_session(session_id)
+    if current and current.get("status") in ("translated", "handled"):
+        print(f"[DB] Skip duplicate translation for {session_id[-8:]}")
+        return
+
+    # Ensure result is a dict
+    if not isinstance(result, dict):
+        result = {
+            "translation": str(result),
+            "transcript":  str(result),
+            "detected_language": "unknown",
+            "engine": "unknown",
+            "urgent_keywords": [],
+            "confidence": "low"
+        }
+
+    translation_json = json.dumps(result, ensure_ascii=False)
     with _lock, _conn() as con:
         con.execute("""
-            INSERT INTO sessions
-                (session_id, phone, timestamp, status, translation)
-            VALUES (?, 'local-test', datetime('now'), 'translated', ?)
+            INSERT INTO sessions (session_id, status, translation, timestamp)
+            VALUES (?, 'translated', ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 translation = excluded.translation,
                 status      = 'translated'
-        """, (session_id, translation_json))
+        """, (session_id, translation_json, datetime.utcnow().isoformat()))
         con.commit()
 
-    engine = result.get("engine", "?")
-    print(f"[DB] Translation saved → {session_id[-8:]}  engine={engine}")
+    print(f"[DB] Translation saved → {session_id[-8:]}  engine={result.get('engine','?')}")
 
-    # ── Push to dashboard via WebSocket ──────────────────────
-    # Late import avoids circular dependency (database ← app ← database)
+    # WebSocket push to dashboard
     try:
         from app import socketio
         session = get_session(session_id)
@@ -100,37 +160,34 @@ def save_translation(session_id: str, result: dict):
     except Exception as e:
         print(f"[WS] Push skipped: {e}")
 
-    # ── Trend detection — field pilot logistics engine ───────────
+    # Trend engine
     try:
-        import importlib.util, sys
-        if importlib.util.find_spec("trend_engine") or "trend_engine" in sys.modules:
+        import importlib.util
+        if importlib.util.find_spec("trend_engine"):
             from trend_engine import check_trends, send_trend_sms
-        else:
-            raise ImportError("trend_engine.py not in project folder")
-        session  = get_session(session_id)
-        alerts   = check_trends(session or {}, result)
-        if alerts:
-            send_trend_sms(alerts)
-            # Push trend alerts to dashboard via WebSocket
-            try:
-                from app import socketio
-                for alert in alerts:
-                    socketio.emit("trend_alert", alert)
-            except Exception:
-                pass
+            session = get_session(session_id)
+            alerts  = check_trends(session or {}, result)
+            if alerts:
+                send_trend_sms(alerts)
+                try:
+                    from app import socketio
+                    for a in alerts:
+                        socketio.emit("trend_alert", a)
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"[TREND] Engine error: {e}")
+        print(f"[TREND] {e}")
 
-    # ── Push to NGO external system via webhook ──────────────
+    # Webhook
     try:
         from webhook import push_to_ngo_system
         session = get_session(session_id)
         if session:
             push_to_ngo_system(session, result)
-    except Exception as e:
-        print(f"[WEBHOOK] Skipped: {e}")
+    except Exception:
+        pass
 
-    # ── SMS alert on urgent keywords ──────────────────────────
+    # SMS alert on urgent keywords
     keywords = result.get("urgent_keywords") or []
     if keywords and SMS_ALERT_NUMBER:
         threading.Thread(
@@ -141,76 +198,38 @@ def save_translation(session_id: str, result: dict):
 
 
 def _send_sms_alert(session_id: str, result: dict, keywords: list):
-    """
-    Sends an SMS to the caseworker when urgent keywords are detected.
-    Sandbox: sender_id=None lets AT use its default (avoids shortcode error).
-    Production: set SENDER_ID=KINGOLIK in .env once you have a registered alphanumeric.
-    """
     try:
         import africastalking
-        sms       = africastalking.SMS
-        session   = get_session(session_id)
-        phone     = session.get("phone", "unknown") if session else "unknown"
-        preview   = (result.get("translation") or "")[:100]
-        kw_str    = ", ".join(keywords[:5])
-        sender_id = os.environ.get("SENDER_ID") or None
-
-        message = (
-            f"KINGOLIK URGENT\n"
-            f"Caller: {phone}\n"
-            f"Alert: {kw_str}\n"
-            f"Said: {preview}"
-        )
-
-        response   = sms.send(message, [SMS_ALERT_NUMBER], sender_id=sender_id)
-        recipients = response.get("SMSMessageData", {}).get("Recipients", [])
-
-        if recipients:
-            status = recipients[0].get("status", "?")
-            print(f"[SMS] Alert sent to {SMS_ALERT_NUMBER}  status={status}")
-            if status != "Success":
-                print(f"[SMS] Full response: {response}")
-        else:
-            print(f"[SMS] Unexpected response: {response}")
-
+        sms     = africastalking.SMS
+        session = get_session(session_id)
+        phone   = session.get("phone","unknown") if session else "unknown"
+        preview = (result.get("translation") or "")[:100]
+        kw_str  = ", ".join(keywords[:5])
+        msg     = f"KINGOLIK URGENT\nCaller: {phone}\nAlert: {kw_str}\nSaid: {preview}"
+        resp    = sms.send(msg, [SMS_ALERT_NUMBER], sender_id=os.environ.get("SENDER_ID"))
+        recips  = resp.get("SMSMessageData",{}).get("Recipients",[])
+        status  = recips[0].get("status","?") if recips else "no_recipients"
+        print(f"[SMS] Alert sent to {SMS_ALERT_NUMBER}  status={status}")
+        if status != "Success":
+            print(f"[SMS] Full response: {resp}")
     except Exception as e:
         print(f"[SMS] Alert failed: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 def save_correction(session_id: str, correction: str):
-    """
-    Saves a caseworker's corrected translation.
-    Every correction becomes a Gold Standard training pair for HITL.
-    """
     with _lock, _conn() as con:
         con.execute(
             "UPDATE sessions SET correction=? WHERE session_id=?",
             (correction, session_id)
         )
         con.commit()
-    print(f"[HITL] Correction saved → {session_id[-8:]}  "
-          f"(gold standard pair #{_count_corrections()})")
+    print(f"[HITL] Correction saved → {session_id[-8:]}")
 
 
 def _count_corrections() -> int:
-    """Count total gold standard pairs collected."""
     with _conn() as con:
         row = con.execute(
-            "SELECT COUNT(*) FROM sessions WHERE correction != ''"
-        ).fetchone()
-    return row[0] if row else 0
-
-
-def get_call_count(phone: str, hours: int = 1) -> int:
-    """Count sessions from this phone in the last N hours — for rate limiting."""
-    from datetime import datetime, timedelta
-    cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-    with _conn() as con:
-        row = con.execute(
-            "SELECT COUNT(*) FROM sessions WHERE phone=? AND timestamp > ?",
-            (phone, cutoff)
+            "SELECT COUNT(*) FROM sessions WHERE correction != '' AND correction IS NOT NULL"
         ).fetchone()
     return row[0] if row else 0
 
@@ -222,21 +241,16 @@ def mark_handled(session_id: str):
             (session_id,)
         )
         con.commit()
-    # Send "help is on the way" feedback SMS to original caller
+    # Send feedback SMS to caller
     try:
         session = get_session(session_id)
         if session:
             import importlib.util
-            if not importlib.util.find_spec("trend_engine"):
-                raise ImportError("trend_engine not installed")
-            from trend_engine import send_feedback_to_caller
-            send_feedback_to_caller(
-                session_id=session_id,
-                phone=session.get("phone",""),
-                eta_hours=2
-            )
-    except Exception as e:
-        print(f"[FEEDBACK] SMS send failed: {e}")
+            if importlib.util.find_spec("trend_engine"):
+                from trend_engine import send_feedback_to_caller
+                send_feedback_to_caller(session_id, session.get("phone",""), eta_hours=2)
+    except Exception:
+        pass
 
 
 def save_note(session_id: str, note: str):
@@ -260,10 +274,22 @@ def get_all_sessions() -> list:
             try:
                 d["translation"] = json.loads(d["translation"])
             except Exception:
-                d["translation"] = {}
+                # If stored as plain string (legacy), wrap it
+                raw = d["translation"]
+                d["translation"] = {
+                    "translation": raw,
+                    "transcript":  raw,
+                    "detected_language": "sw",
+                    "engine": "legacy",
+                    "urgent_keywords": [],
+                    "confidence": "medium"
+                }
         else:
             d["translation"] = {}
         d["handled"] = bool(d.get("handled", 0))
+        # Ensure audio_url is set — dashboard uses /api/audio/{session_id}
+        if not d.get("audio_url"):
+            d["audio_url"] = f"/api/audio/{d['session_id']}"
         result.append(d)
     return result
 
@@ -280,22 +306,27 @@ def get_session(session_id: str):
         try:
             d["translation"] = json.loads(d["translation"])
         except Exception:
-            d["translation"] = {}
+            raw = d["translation"]
+            d["translation"] = {
+                "translation": raw, "transcript": raw,
+                "detected_language": "sw", "engine": "legacy",
+                "urgent_keywords": [], "confidence": "medium"
+            }
     else:
         d["translation"] = {}
     d["handled"] = bool(d.get("handled", 0))
+    if not d.get("audio_url"):
+        d["audio_url"] = f"/api/audio/{d['session_id']}"
     return d
 
 
 def migrate_from_json(json_path: str = "sessions.json"):
     if not os.path.exists(json_path):
-        print("[MIGRATE] No sessions.json — skipping")
         return
     with open(json_path) as f:
         try:
             sessions = json.load(f)
-        except Exception as e:
-            print(f"[MIGRATE] Parse error: {e}")
+        except Exception:
             return
     count = 0
     for sid, s in sessions.items():
@@ -304,56 +335,25 @@ def migrate_from_json(json_path: str = "sessions.json"):
             con.execute("""
                 INSERT OR IGNORE INTO sessions
                     (session_id, phone, menu_choice, timestamp, status,
-                     source_wav, recording_url, duration,
+                     source_wav, recording_url, audio_url, duration,
                      handled, note, translation)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
-                sid,
-                s.get("phone", ""),
-                s.get("menu_choice", ""),
-                s.get("timestamp", ""),
-                s.get("status", "pending_call"),
-                s.get("source_wav", ""),
-                s.get("recording_url", ""),
-                s.get("duration", ""),
-                1 if s.get("handled") else 0,
-                s.get("note", ""),
-                json.dumps(t)
+                sid, s.get("phone",""), s.get("menu_choice",""), s.get("timestamp",""),
+                s.get("status","pending_call"), s.get("source_wav",""),
+                s.get("recording_url",""), s.get("audio_url",""), s.get("duration",""),
+                1 if s.get("handled") else 0, s.get("note",""),
+                json.dumps(t) if isinstance(t, dict) else str(t)
             ))
             con.commit()
         count += 1
-    print(f"[MIGRATE] Imported {count} sessions from {json_path}")
+    if count:
+        print(f"[MIGRATE] Imported {count} sessions from {json_path}")
 
 
-# Legacy shims
+# Legacy shims for compatibility
 def _load() -> dict:
     return {s["session_id"]: s for s in get_all_sessions()}
-
-
-def _write(data: dict):
-    for sid, s in data.items():
-        t = s.get("translation", {})
-        with _lock, _conn() as con:
-            con.execute("""
-                INSERT INTO sessions
-                    (session_id, phone, timestamp, status,
-                     handled, note, translation)
-                VALUES (?,?,?,?,?,?,?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    status      = excluded.status,
-                    handled     = excluded.handled,
-                    note        = excluded.note,
-                    translation = excluded.translation
-            """, (
-                sid,
-                s.get("phone", ""),
-                s.get("timestamp", ""),
-                s.get("status", "pending_call"),
-                1 if s.get("handled") else 0,
-                s.get("note", ""),
-                json.dumps(t)
-            ))
-            con.commit()
 
 
 # Initialise on import

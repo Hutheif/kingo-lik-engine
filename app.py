@@ -2,7 +2,7 @@ from gevent import monkey
 monkey.patch_all()
 
 from flask_socketio import SocketIO
-from flask import Flask, request, make_response, jsonify, send_file
+from flask import Flask, request, make_response, jsonify, send_file, send_from_directory
 import africastalking
 import os, re, json, datetime, threading, logging, time
 from collections import defaultdict
@@ -12,6 +12,10 @@ load_dotenv()
 
 app      = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+
+@app.route('/recordings/<path:filename>')
+def serve_recording(filename):
+    return send_from_directory('recordings', filename, as_attachment=False)
 
 from dashboard import dashboard_bp
 app.register_blueprint(dashboard_bp)
@@ -25,14 +29,9 @@ start_sync_worker()
 AT_USERNAME        = os.getenv("AT_USERNAME", "sandbox")
 AT_API_KEY         = os.getenv("AT_API_KEY", "")
 YOUR_NUMBER        = os.getenv("AT_VIRTUAL_NUMBER", "+254711082547")
-BASE_URL           = os.getenv("BASE_URL", "").rstrip("/")
+BASE_URL           = os.getenv("BASE_URL", "https://kingo-lik-engine.onrender.com").rstrip("/")
 GREETING_AUDIO_URL = os.getenv("GREETING_AUDIO_URL", "")
 
-# Guard against empty BASE_URL
-if not BASE_URL:
-    BASE_URL = "https://kingo-lik-engine.onrender.com"
-
-# Hard-block the blacklisted number
 _raw_alert  = os.getenv("ALERT_PHONE", "")
 BLACKLISTED = {"+254706648650"}
 ALERT_PHONE = "" if _raw_alert in BLACKLISTED else _raw_alert
@@ -48,22 +47,11 @@ if AT_API_KEY:
 else:
     print("[AT] WARNING — no AT_API_KEY")
 
-if not ALERT_PHONE:
-    print("[WARN] ALERT_PHONE not set or blacklisted — SMS alerts disabled")
-else:
-    print(f"[OK] ALERT_PHONE={ALERT_PHONE}")
+print(f"[OK] BASE_URL={BASE_URL}")
+print(f"[ALERT] {ALERT_PHONE or 'SMS alerts disabled'}")
 
 is_ngrok  = "ngrok" in BASE_URL
 is_render = "onrender.com" in BASE_URL
-is_local  = "127.0.0.1" in BASE_URL or "localhost" in BASE_URL
-
-print(f"[OK] BASE_URL={BASE_URL}")
-if is_local:
-    print("[CRITICAL] BASE_URL is localhost — AT cannot reach it! Run ngrok and update .env")
-elif is_ngrok:
-    print("[INFO] Running via ngrok — recording callback will reach this laptop")
-elif is_render:
-    print("[INFO] Running on Render — all callbacks go to Render")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -96,16 +84,13 @@ class Log:
 
 # ══════════════════════════════════════════════════════════════
 #  Phone normalisation
-#  Handles: 0714137554 → +254714137554
-#           254714137554 → +254714137554
-#           +254714137554 → unchanged
 # ══════════════════════════════════════════════════════════════
-def _norm(phone: str) -> str:
+def _norm(phone:str)->str:
     if not phone: return ""
-    p = phone.strip().replace(" ","").replace("-","")
+    p=phone.strip().replace(" ","").replace("-","")
     if p.startswith("+254"): return p
-    if p.startswith("254") and len(p) >= 12: return "+" + p
-    if p.startswith("0") and len(p) == 10: return "+254" + p[1:]
+    if p.startswith("254") and len(p)>=12: return "+"+p
+    if p.startswith("0") and len(p)==10: return "+254"+p[1:]
     return p
 
 
@@ -116,8 +101,8 @@ _raw_wl = os.getenv("ALLOWED_PHONES","")
 ALLOWED = set(_norm(p.strip()) for p in _raw_wl.split(",") if p.strip()) if _raw_wl else set()
 print(f"[SEC] Whitelist: {sorted(ALLOWED)}" if ALLOWED else "[SEC] All phones accepted")
 
-_rs = defaultdict(list); _rl = threading.Lock()
-RLIMIT=5; RWIN=3600
+_rs=defaultdict(list); _rl=threading.Lock()
+RLIMIT=999; RWIN=3600
 
 def _limited(phone:str)->bool:
     phone=_norm(phone); now=time.time()
@@ -133,12 +118,13 @@ def _allowed(phone:str)->bool:
 # ══════════════════════════════════════════════════════════════
 #  Urgent keywords
 # ══════════════════════════════════════════════════════════════
-URGENT_KW = [
+URGENT_KW=[
     "help","msaada","haraka","emergency","hatari","moto","fire",
     "damu","blood","jeraha","injury","attack","shambulio","wezi",
     "thieves","robbery","vita","violence","mgonjwa","sick","hospital",
     "njaa","hunger","maji","water","missing","kupotea","police","polisi",
-    "ninavamiwa","navamiwa","attacked","danger","sos","mjamzito","pregnant"
+    "ninavamiwa","navamiwa","attacked","danger","sos","mjamzito","pregnant",
+    "chakula","food","wezi","thieves"
 ]
 
 def _kws(text:str)->list:
@@ -149,8 +135,12 @@ def _kws(text:str)->list:
 # ══════════════════════════════════════════════════════════════
 #  State
 # ══════════════════════════════════════════════════════════════
-_answered: set = set()   # AT sessionIds already served greeting XML
-_pending:  dict = {}     # phone → our_session_id
+_answered: set = set()
+# phone → our_session_id
+# KEY FIX: we also store at_session_id → our_session_id
+# so when AT posts recording with AT's sessionId, we can find ours
+_pending:  dict = {}
+_at_to_our: dict = {}  # AT sessionId → our session_id
 
 
 # ══════════════════════════════════════════════════════════════
@@ -163,39 +153,24 @@ def _reject():
     return _xml('<?xml version="1.0" encoding="UTF-8"?><Response><Reject/></Response>')
 
 def _greeting(session_id:str):
-    """
-    Greeting XML served when outbound call is answered.
-    finishOnKey="#*" — user presses # or * to end recording.
-    Hanging up ALSO triggers recording callback on most networks.
-    callbackUrl points to /voice/save which handles the recording.
-    """
-    cb = f"{BASE_URL}/voice/save?session_id={session_id}"
+    cb=f"{BASE_URL}/voice/save?session_id={session_id}"
     if GREETING_AUDIO_URL:
-        voice_xml = f'<Play>{GREETING_AUDIO_URL}</Play>'
+        v=f'<Play>{GREETING_AUDIO_URL}</Play>'
     else:
-        voice_xml = (
-            '<Say voice="woman" playBeep="false">'
-            'Habari, karibu King-olik. '
-            'Simu hii ni bure kwako. '
-            'Tafadhali sema ujumbe wako baada ya mlio. '
-            'Bonyeza hash ukimaliza. Asante.'
-            '</Say>'
-        )
+        v=('<Say voice="woman" playBeep="false">'
+           'Habari, karibu King-olik. '
+           'Simu hii ni bure kwako. '
+           'Tafadhali sema ujumbe wako baada ya mlio. '
+           'Bonyeza hash ukimaliza. Asante.'
+           '</Say>')
     return _xml(f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  {voice_xml}
-  <Record
-    finishOnKey="#*"
-    maxLength="120"
-    trimSilence="true"
-    playBeep="true"
-    callbackUrl="{cb}"
-  />
+  {v}
+  <Record finishOnKey="#*" maxLength="120" trimSilence="true"
+          playBeep="true" callbackUrl="{cb}"/>
 </Response>""")
 
-def _empty():
-    return make_response("",200)
-
+def _empty(): return make_response("",200)
 def _tr(b:str):
     r=make_response(b,200); r.headers["Content-Type"]="text/plain"; return r
 
@@ -269,7 +244,10 @@ def ussd():
 
 
 def _translate_text(session_id:str, raw:str, phone:str):
-    """Translate USSD option-4 text report via Gemini. Retries 3x on 503."""
+    """
+    Translates USSD option-4 text report via Gemini.
+    Saves result as a proper dict so dashboard can display translation + transcript.
+    """
     kws=_kws(raw); translation=raw; lang="sw"; conf="medium"; engine="ussd_text"
     key=os.environ.get("GEMINI_API_KEY","")
     if key:
@@ -280,38 +258,45 @@ def _translate_text(session_id:str, raw:str, phone:str):
                 client=genai.Client(api_key=key)
                 prompt=(
                     "Translate this humanitarian field report to English. "
-                    "May be Swahili, Turkana, Somali, Arabic, or mixed. "
-                    'Return ONLY a JSON object: {"detected_language":"sw","translation":"...","urgent_keywords":[],"confidence":"high"}\n\n'
+                    "It may be Swahili, Turkana, Somali, Arabic, or mixed. "
+                    'Return ONLY JSON: {"detected_language":"sw","translation":"...","urgent_keywords":[],"confidence":"high"}\n\n'
                     f"Text: {raw}"
                 )
                 resp=client.models.generate_content(
                     model="models/gemini-2.5-flash",
                     contents=[types.Content(parts=[types.Part(text=prompt)])]
                 )
-                raw_resp=re.sub(r"```json|```","",resp.text or "").strip()
-                m=re.search(r'\{.*\}',raw_resp,re.DOTALL)
-                if not m:
-                    raise ValueError(f"No JSON in response: {raw_resp[:80]}")
-                p=json.loads(m.group())
-                translation=p.get("translation",raw)
-                lang=p.get("detected_language","sw")
-                kws=list(set(kws+(p.get("urgent_keywords") or [])))
-                conf=p.get("confidence","medium")
-                engine="gemini_text"
-                Log.ok(f"Gemini translated [{session_id[-8:]}]: '{translation[:60]}'")
-                break
+                r=re.sub(r"```json|```","",resp.text.strip()).strip()
+                m=re.search(r'\{.*\}',r,re.DOTALL)
+                if m:
+                    p=json.loads(m.group())
+                    translation=p.get("translation",raw)
+                    lang=p.get("detected_language","sw")
+                    kws=list(set(kws+(p.get("urgent_keywords") or [])))
+                    conf=p.get("confidence","medium")
+                    engine="gemini_text"
+                    Log.ok(f"Gemini translated [{session_id[-8:]}]: '{translation[:60]}'")
+                    break
             except Exception as e:
                 if "503" in str(e) and attempt<2:
                     Log.warn(f"Gemini 503 attempt {attempt+1}/3 — retry 3s"); time.sleep(3)
                 else:
                     Log.warn(f"Gemini failed: {e}"); break
 
-    result={"transcript":raw,"detected_language":lang,"translation":translation,
-            "urgent_keywords":kws,"confidence":conf,"engine":engine,
-            "requires_review":conf=="low","is_text_report":True}
+    # FIX: Always save as a DICT — this is what the dashboard expects
+    result = {
+        "transcript":        raw,           # original Swahili/whatever text
+        "detected_language": lang,
+        "translation":       translation,   # English translation
+        "urgent_keywords":   kws,
+        "confidence":        conf,
+        "engine":            engine,
+        "requires_review":   conf=="low",
+        "is_text_report":    True           # tells dashboard: no audio player
+    }
     from database import save_translation
-    save_translation(session_id,result)
-    Log.ok(f"Text report saved [{session_id[-8:]}]  lang={lang}")
+    save_translation(session_id, result)    # DICT, not raw string
+    Log.ok(f"Text saved [{session_id[-8:]}]  lang={lang}  translation='{translation[:50]}'")
     if kws and ALERT_PHONE:
         threading.Thread(target=_alert_sms,args=(session_id,phone,result),daemon=True).start()
 
@@ -320,20 +305,18 @@ def _alert_sms(session_id:str, caller:str, result:dict):
     if not sms_service or not ALERT_PHONE: return
     try:
         kws=result.get("urgent_keywords",[]); t=result.get("translation","")[:100]
-        msg=(f"KINGOLIK URGENT\nFrom:{caller}\nAlert:{','.join(kws[:5])}\nSaid:{t}\nRef:{session_id[-8:]}")
+        msg=f"KINGOLIK URGENT\nFrom:{caller}\nAlert:{','.join(kws[:5])}\nSaid:{t}\nRef:{session_id[-8:]}"
         resp=sms_service.send(message=msg,recipients=[ALERT_PHONE])
         recips=resp.get("SMSMessageData",{}).get("Recipients",[])
         status=recips[0].get("status","?") if recips else "no_recipients"
-        if status=="Success":
-            Log.ok(f"Alert SMS sent → {ALERT_PHONE}")
-        else:
-            Log.warn(f"Alert SMS status={status} number={ALERT_PHONE}")
+        if status=="Success": Log.ok(f"Alert SMS → {ALERT_PHONE}")
+        else: Log.warn(f"Alert SMS status={status}")
     except Exception as e:
         Log.error(f"Alert SMS: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  Outbound call with retry
+#  Outbound call
 # ══════════════════════════════════════════════════════════════
 def _call_back(phone:str, session_id:str, max_attempts:int=3):
     phone=_norm(phone)
@@ -376,16 +359,6 @@ def _fallback(phone:str, session_id:str):
 
 # ══════════════════════════════════════════════════════════════
 #  /voice/answer
-#
-#  Set in AT dashboard: Voice → +254711082547 → Voice callback URL:
-#  https://kingo-lik-engine.onrender.com/voice/answer
-#
-#  isActive=1 + inbound  → flash call → reject + callback
-#  isActive=1 + outbound → answered  → serve greeting XML
-#  isActive=0            → ended     → check for recordingUrl
-#
-#  NOTE: AT sandbox sometimes posts recordingUrl here too.
-#  We check for it in every request.
 # ══════════════════════════════════════════════════════════════
 @app.route("/voice/answer", methods=["POST","GET"])
 def voice_answer():
@@ -396,12 +369,11 @@ def voice_answer():
     is_active = (request.values.get("isActive","0") or "0")
     at_sid    = (request.values.get("sessionId","") or "")
 
-    rec_url = (
+    rec_url=(
         request.form.get("recordingUrl") or request.form.get("RecordingUrl") or
         request.values.get("recordingUrl") or request.values.get("RecordingUrl") or ""
     )
-    dur = (request.form.get("durationInSeconds") or
-           request.values.get("durationInSeconds") or "0")
+    dur=(request.form.get("durationInSeconds") or request.values.get("durationInSeconds") or "0")
 
     Log.info(
         f"VOICE  caller={caller}  dest={dest}  dir={direction}"
@@ -409,14 +381,24 @@ def voice_answer():
         f"  atSid=[...{at_sid[-8:] if at_sid else '?'}]"
     )
 
-    # Recording arrived here (AT sandbox sometimes posts it here)
+    # Recording present — process it
     if rec_url:
         Log.ok(f"Recording in /voice/answer  dur={dur}s")
-        user_phone = dest if dest != YOUR_NUMBER else caller
-        sid = (request.args.get("session_id") or
-               _pending.pop(user_phone,None) or
-               _pending.pop(caller,None) or
-               f"rec_{datetime.datetime.utcnow().strftime('%H%M%S')}")
+        user_phone = dest if dest!=YOUR_NUMBER else caller
+
+        # FIX: Resolve session_id by checking multiple sources
+        # 1. URL param (set when we build callbackUrl)
+        # 2. AT→our session map (set when we served greeting)
+        # 3. _pending by phone
+        # 4. Fall back to AT session ID
+        sid = (
+            request.args.get("session_id") or
+            _at_to_our.pop(at_sid, None) or
+            _pending.pop(user_phone, None) or
+            _pending.pop(caller, None) or
+            at_sid or
+            f"rec_{datetime.datetime.utcnow().strftime('%H%M%S')}"
+        )
         _handle_recording(sid, rec_url, dur)
         return _empty()
 
@@ -443,129 +425,266 @@ def voice_answer():
         return _empty()
     _answered.add(at_sid)
 
-    user_phone = dest if dest != YOUR_NUMBER else caller
+    user_phone = dest if dest!=YOUR_NUMBER else caller
     our_sid = (
         _pending.pop(user_phone,None) or
         _pending.pop(caller,None) or
         _pending.pop(dest,None) or
         f"ans_{datetime.datetime.utcnow().strftime('%H%M%S')}"
     )
-    Log.ok(f"OUTBOUND ANSWERED  user={user_phone}  session=[...{our_sid[-8:]}]")
+
+    # FIX: Store AT sessionId → our session_id mapping
+    # When AT posts recording callback with its own sessionId, we can find ours
+    _at_to_our[at_sid] = our_sid
+    Log.ok(f"OUTBOUND ANSWERED  user={user_phone}  session=[...{our_sid[-8:]}]  atSid=[...{at_sid[-8:]}]")
     return _greeting(our_sid)
 
 
 # ══════════════════════════════════════════════════════════════
-#  /voice/save — AT posts recording here after user presses #/*
+#  /voice/save — explicit recording callback
 # ══════════════════════════════════════════════════════════════
 @app.route("/voice/save", methods=["POST","GET"])
 def voice_save():
-    Log.ok("VOICE/SAVE HIT ← recording arrived")
+    Log.ok("VOICE/SAVE HIT ← recording arrived from AT")
     Log.info(f"  form={dict(request.form)}")
 
-    sid = (request.args.get("session_id") or request.values.get("sessionId") or "")
-    url = (
+    at_sid=(request.values.get("sessionId") or "")
+    sid = (
+        request.args.get("session_id") or
+        _at_to_our.pop(at_sid, None) or
+        request.values.get("sessionId") or ""
+    )
+    url=(
         request.form.get("recordingUrl") or request.form.get("RecordingUrl") or
         request.values.get("recordingUrl") or request.values.get("RecordingUrl") or
         request.args.get("recordingUrl") or ""
     )
-    dur = (request.form.get("durationInSeconds") or
-           request.values.get("durationInSeconds") or "0")
+    dur=(request.form.get("durationInSeconds") or request.values.get("durationInSeconds") or "0")
 
-    Log.info(f"  sid={sid or 'NONE'}  url={'YES '+dur+'s' if url else 'NONE'}")
+    Log.info(f"  our_sid={sid or 'NONE'}  url={'YES '+dur+'s' if url else 'NONE'}")
 
     if url:
         _handle_recording(sid, url, dur)
     else:
-        Log.warn("No recordingUrl — user may not have pressed # after speaking")
-        Log.warn(f"Tell user: speak then press # to save. Recording goes to {BASE_URL}/voice/save")
+        Log.warn("No recordingUrl — user may not have pressed #")
 
     return _empty()
 
 
 def _handle_recording(session_id:str, recording_url:str, duration:str="0"):
     """
-    Downloads AT recording, saves as {session_id}_raw.wav,
-    runs translation pipeline, pushes result to dashboard.
+    Downloads recording to {session_id}_raw.wav — preserving session_id.
+    Then runs translation pipeline.
     """
-    from database import update_call_record
+    from database import update_call_record, save_audio_url
     if session_id:
         update_call_record(session_id, recording_url, duration)
 
-    sid = session_id or f"rec_{datetime.datetime.utcnow().strftime('%H%M%S')}"
+    sid=session_id or f"rec_{datetime.datetime.utcnow().strftime('%H%M%S')}"
     Log.ok(f"Processing recording [{sid[-8:]}]  dur={duration}s")
 
     def run():
-        recordings_dir = os.path.join(os.getcwd(), "recordings")
-        os.makedirs(recordings_dir, exist_ok=True)
-        local_path = os.path.join(recordings_dir, f"{sid}_raw.wav")
+        recordings_dir=os.path.join(os.getcwd(),"recordings")
+        os.makedirs(recordings_dir,exist_ok=True)
 
-        downloaded = False
+        # FIX: Always name file using OUR session_id, not AT's ID
+        # This ensures /api/audio/{session_id} finds the file
+        local_path=os.path.join(recordings_dir,f"{sid}_raw.wav")
+        downloaded=False
+
         if recording_url.startswith("http"):
             try:
                 import requests as req
                 Log.info(f"Downloading [{sid[-8:]}] ...")
-                headers = {}
+                headers={}
                 if AT_API_KEY:
                     import base64
-                    creds = base64.b64encode(f"{AT_USERNAME}:{AT_API_KEY}".encode()).decode()
-                    headers["Authorization"] = f"Basic {creds}"
-                r = req.get(recording_url, headers=headers, timeout=30)
-                if r.status_code == 200:
-                    with open(local_path, "wb") as f:
-                        f.write(r.content)
-                    downloaded = True
+                    creds=base64.b64encode(f"{AT_USERNAME}:{AT_API_KEY}".encode()).decode()
+                    headers["Authorization"]=f"Basic {creds}"
+                r=req.get(recording_url,headers=headers,timeout=30)
+                if r.status_code==200:
+                    with open(local_path,"wb") as f: f.write(r.content)
+                    downloaded=True
                     Log.ok(f"Saved [{sid[-8:]}] → {os.path.basename(local_path)}")
                 else:
-                    Log.warn(f"Download HTTP {r.status_code} — will try URL directly")
+                    Log.warn(f"Download HTTP {r.status_code}")
             except Exception as e:
                 Log.error(f"Download failed: {e}")
         elif os.path.exists(recording_url):
-            # Local file path (test mode)
-            local_path = recording_url
-            downloaded = True
+            import shutil
+            try:
+                if os.path.abspath(recording_url) != os.path.abspath(local_path):
+                    shutil.copy2(recording_url, local_path)
+                else:
+                    local_path = recording_url
+                downloaded=True
+                Log.ok(f"Copied local file → {os.path.basename(local_path)}")
+            except Exception as e:
+                Log.error(f"File copy failed: {e}")
+                local_path=recording_url; downloaded=True
 
-        source = local_path if downloaded else recording_url
+        if not downloaded:
+            Log.error(f"Could not get audio for [{sid[-8:]}]")
+            return
+
+        # Set audio_url so dashboard knows where to find the audio
+        try:
+            save_audio_url(sid, f"/api/audio/{sid}")
+        except Exception:
+            pass
+
         try:
             from translator import process_recording
-            process_recording(sid, source)
+            process_recording(sid, local_path)
             Log.ok(f"Translation pipeline started [{sid[-8:]}]")
         except Exception as e:
             Log.error(f"Translation failed [{sid[-8:]}]: {e}")
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=run,daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════
-#  /sms — Please-Call-Me trigger + urgent keyword detection
+#  /sms — SMS Beacon System
+#
+#  HOW IT WORKS (Text-to-Voice Bridge):
+#  1. User sends ANY SMS to +254711082547 (works even on weak signal)
+#  2. System checks for emergency keywords
+#  3. If urgent keywords found:
+#     a. Saves text as immediate report on dashboard
+#     b. Sends confirmation SMS back instantly: "We received your message. Calling you in 10 seconds."
+#     c. Triggers voice callback in 10 seconds
+#  4. If no keywords (plain PCM / missed call signal):
+#     a. Sends confirmation SMS
+#     b. Triggers voice callback in 10 seconds
+#
+#  EMERGENCY KEYWORDS that trigger immediate action:
+#  help, msaada, moto, fire, damu, blood, attack, wezi, thieves,
+#  emergency, hatari, danger, njaa, hunger, maji, water, haraka,
+#  sos, injured, sick, missing + 30 more in 7 languages
 # ══════════════════════════════════════════════════════════════
+
+# Extended emergency keyword list for SMS beacon
+SMS_BEACON_KEYWORDS = set([
+    # English
+    "help","sos","emergency","fire","attack","blood","injured","sick",
+    "danger","missing","flood","thief","thieve","thieves","robbery",
+    "violence","hurt","dying","dead","stuck","trapped","rape","abuse",
+    # Kiswahili
+    "msaada","haraka","hatari","moto","damu","wezi","vita","jeraha",
+    "mgonjwa","kupotea","njaa","maji","saidia","tafadhali","dharura",
+    "navamiwa","ninavamiwa","shambulio","bunduki","kisu","kuumia",
+    # Somali
+    "gargaar","degdeg","khatar","weerar","dab","dhiig","baahi",
+    # Turkana
+    "apese","ngosi","ekisil","tukoi","abakare",
+    # Single-word distress
+    "help!","mayday","urgent","critical","please",
+])
+
+def _is_emergency_sms(text: str) -> bool:
+    """Returns True if SMS contains emergency keywords."""
+    t = text.lower().strip()
+    words = re.findall(r'\w+', t)
+    for word in words:
+        if word in SMS_BEACON_KEYWORDS:
+            return True
+    # Also check if the entire short message IS a keyword
+    if t in SMS_BEACON_KEYWORDS:
+        return True
+    return False
+
+
+def _send_confirmation_sms(sender: str, is_emergency: bool, session_id: str):
+    """
+    Sends immediate SMS confirmation back to the sender.
+    This gives the user confidence their message was received.
+    Works even if AT sandbox SMS is limited.
+    """
+    if not sms_service:
+        return
+    try:
+        if is_emergency:
+            msg = (
+                f"King'olik: Tumepokea ujumbe wako wa dharura.\n"
+                f"We received your emergency message.\n"
+                f"Tutakupigia simu ndani ya sekunde 10.\n"
+                f"We are calling you in 10 seconds. FREE.\n"
+                f"Ref: {session_id[-6:]}"
+            )
+        else:
+            msg = (
+                f"King'olik: Ujumbe wako umepokelewa.\n"
+                f"Your message received.\n"
+                f"Tutakupigia simu bure hivi karibuni.\n"
+                f"We will call you back shortly. FREE.\n"
+                f"Dial *789*1990# for USSD menu."
+            )
+        resp = sms_service.send(message=msg, recipients=[sender])
+        recips = resp.get("SMSMessageData",{}).get("Recipients",[])
+        status = recips[0].get("status","?") if recips else "no_recipients"
+        Log.ok(f"Confirmation SMS → {sender}  status={status}")
+        if status != "Success":
+            Log.warn(f"Confirmation SMS not delivered: status={status} (may be sandbox limitation)")
+    except Exception as e:
+        Log.error(f"Confirmation SMS failed: {e}")
+
+
 @app.route("/sms", methods=["POST","GET"])
 def sms():
-    sender=_norm(request.values.get("from") or request.values.get("fromNumber") or "")
-    text=(request.values.get("text") or "").strip()
-    Log.info(f"SMS from={sender}  text='{text[:80]}'")
+    """
+    SMS Beacon receiver.
+    Any SMS to the King'olik number triggers this.
+    """
+    sender = _norm(request.values.get("from") or request.values.get("fromNumber") or "")
+    text   = (request.values.get("text") or "").strip()
+    Log.info(f"SMS BEACON  from={sender}  text='{text[:80]}'")
 
-    if not sender: return _empty()
-    if not _allowed(sender): Log.warn(f"SMS blocked: {sender}"); return _empty()
-    if _limited(sender): Log.warn(f"SMS rate limit: {sender}"); return _empty()
+    if not sender:
+        return _empty()
+    if not _allowed(sender):
+        Log.warn(f"SMS blocked: {sender}")
+        return _empty()
+    if _limited(sender):
+        Log.warn(f"SMS rate limit: {sender}")
+        return _empty()
 
-    kws=_kws(text)
-    sid=f"sms_{datetime.datetime.utcnow().strftime('%H%M%S%f')[:15]}"
+    is_emergency = _is_emergency_sms(text)
+    kws = _kws(text)
+    sid = f"sms_{datetime.datetime.utcnow().strftime('%H%M%S%f')[:15]}"
+
     from database import save_session
-    save_session({"session_id":sid,"phone":sender,"menu_choice":"sms",
-                  "timestamp":datetime.datetime.utcnow().isoformat(),"status":"pending_call"})
+    save_session({
+        "session_id": sid,
+        "phone":      sender,
+        "menu_choice": "sms_beacon",
+        "timestamp":  datetime.datetime.utcnow().isoformat(),
+        "status":     "pending_call"
+    })
 
-    if kws and text:
-        Log.ok(f"SMS urgent [{kws}] from {sender} — saving report + callback")
-        threading.Thread(target=_translate_text,args=(sid,text,sender),daemon=True).start()
+    if is_emergency and text:
+        Log.ok(f"SMS BEACON EMERGENCY [{kws}] from {sender} — saving report + callback")
+        # Save text as immediate dashboard report
+        threading.Thread(
+            target=_translate_text, args=(sid, text, sender), daemon=True
+        ).start()
     else:
-        Log.ok(f"SMS/PCM from {sender} — callback in 3s")
+        Log.ok(f"SMS BEACON from {sender} — callback triggered")
 
-    socketio.start_background_task(_call_back,sender,sid)
+    # Send confirmation SMS immediately (don't wait for callback)
+    threading.Thread(
+        target=_send_confirmation_sms,
+        args=(sender, is_emergency, sid),
+        daemon=True
+    ).start()
+
+    # Trigger voice callback in 10 seconds
+    socketio.start_background_task(_call_back, sender, sid)
+
     return _empty()
 
 
 # ══════════════════════════════════════════════════════════════
-#  WAV picker (test fallback only)
+#  WAV picker
 # ══════════════════════════════════════════════════════════════
 def _wav():
     d=os.path.join(os.getcwd(),"recordings")
@@ -603,13 +722,8 @@ def test_file(filename):
 
 @app.route("/test/call/<path:phone>")
 def test_call(phone):
-    """
-    Full E2E test.
-    Flow: Answer phone → hear greeting → speak → press # → see translation on /dashboard
-    """
     phone=_norm(phone)
-    if not voice_service:
-        return jsonify({"error":"AT_API_KEY not set"}),500
+    if not voice_service: return jsonify({"error":"AT_API_KEY not set"}),500
     sid=f"test_{datetime.datetime.utcnow().strftime('%H%M%S')}"
     from database import save_session
     save_session({"session_id":sid,"phone":phone,"menu_choice":"test",
@@ -617,48 +731,31 @@ def test_call(phone):
     threading.Thread(target=_call_back,args=(phone,sid),daemon=True).start()
     return jsonify({
         "status":"calling","phone":phone,"session":sid,
-        "step1":"Answer phone in ~3 seconds",
+        "step1":"Answer in ~3 seconds",
         "step2":"Hear greeting + beep",
         "step3":"Speak your message",
-        "step4":"Press # to end recording (IMPORTANT)",
-        "step5":"Watch terminal for: VOICE/SAVE HIT",
-        "step6":"Translation appears on /dashboard within 30s"
+        "step4":"Press # to end (important on AT sandbox)",
+        "step5":"Watch terminal: VOICE/SAVE HIT",
+        "step6":"Translation on /dashboard within 30s"
     }),200
 
 @app.route("/test/sim-save")
 def test_sim_save():
-    """
-    Simulate AT posting a recording — tests translation pipeline without a real call.
-    GET /test/sim-save to use most recent session + best available test audio.
-    """
     sid=request.args.get("session_id","")
     if not sid:
         from database import get_all_sessions
         sessions=get_all_sessions()
         recent=[s for s in sessions if s.get("status") in ("pending_call","recorded")]
         sid=recent[0]["session_id"] if recent else f"simtest_{datetime.datetime.utcnow().strftime('%H%M%S')}"
-
-    test_wav=_wav()
-    if test_wav:
-        Log.ok(f"Sim-save: {os.path.basename(test_wav)}")
-        _handle_recording(sid, test_wav, "15")
-        source=os.path.basename(test_wav)
-    else:
-        Log.ok("Sim-save: no local WAV — cannot test without audio file")
-        return jsonify({"error":"No WAV files in recordings/ folder",
-                        "fix":"Run /test/call/+YOUR_NUMBER first to create a recording"}),404
-
-    return jsonify({
-        "status":     "Pipeline test started",
-        "session_id": sid,
-        "source":     source,
-        "watch":      "/dashboard — translation card should appear within 30 seconds",
-        "terminal":   "Look for [TRANSLATE] and [DB] Translation saved in logs"
-    }),200
+    wav=_wav()
+    if not wav: return jsonify({"error":"No WAV in recordings/"}),404
+    Log.ok(f"Sim-save [{sid[-8:]}] {os.path.basename(wav)}")
+    _handle_recording(sid,wav,"15")
+    return jsonify({"status":"Pipeline test started","session_id":sid,
+                    "source":os.path.basename(wav),"watch":"/dashboard"}),200
 
 @app.route("/test/sms/<phone>")
 def test_sms(phone):
-    """Simulate PCM from a number — triggers callback."""
     phone=_norm(phone)
     sid=f"sms_test_{datetime.datetime.utcnow().strftime('%H%M%S')}"
     from database import save_session
@@ -670,42 +767,22 @@ def test_sms(phone):
 @app.route("/test/at-config")
 def at_config():
     return jsonify({
-        "AT_dashboard_settings": {
-            "voice_callback_url": f"{BASE_URL}/voice/answer",
-            "ussd_callback_url":  f"{BASE_URL}/ussd",
-            "sms_callback_url":   f"{BASE_URL}/sms",
-        },
-        "recording_flow": {
-            "step1": "User answers callback → hears greeting + beep",
-            "step2": "User speaks their message",
-            "step3": "User presses # (hash key) to end recording",
-            "step4": f"AT posts recording to: {BASE_URL}/voice/save",
-            "step5": "Server downloads audio file from AT",
-            "step6": "Gemini or Whisper translates audio to English",
-            "step7": "Translation pushed to /dashboard via WebSocket"
-        },
-        "test_endpoints": {
-            "call":     f"{BASE_URL}/test/call/+YOUR_PHONE",
-            "sim_save": f"{BASE_URL}/test/sim-save",
-            "local":    f"{BASE_URL}/test/local"
-        },
-        "env_status": {
-            "ALERT_PHONE":     ALERT_PHONE or "NOT SET",
-            "BASE_URL":        BASE_URL,
-            "ngrok":           is_ngrok,
-            "render":          is_render,
-            "whitelist_count": len(ALLOWED),
-            "whitelist":       sorted(ALLOWED) if ALLOWED else "all phones accepted"
-        },
-        "render_env_vars_needed": {
-            "ALLOWED_PHONES":  "comma separated, no spaces, +254 prefix",
-            "ALERT_PHONE":     "+254714137554 (your number)",
-            "AT_API_KEY":      "your AT production key",
-            "BASE_URL":        "https://kingo-lik-engine.onrender.com",
-            "GEMINI_API_KEY":  "your Gemini key",
-            "GROQ_API_KEY":    "your Groq key"
-        }
+        "AT_voice_callback_url": f"{BASE_URL}/voice/answer",
+        "AT_ussd_callback_url":  f"{BASE_URL}/ussd",
+        "AT_sms_callback_url":   f"{BASE_URL}/sms",
+        "recording_callback":    f"{BASE_URL}/voice/save",
+        "test_call":             f"{BASE_URL}/test/call/+YOUR_PHONE",
+        "status":{"ALERT_PHONE":ALERT_PHONE or "NOT SET","BASE_URL":BASE_URL,
+                  "whitelist":sorted(ALLOWED) if ALLOWED else "all"}
     })
+
+@app.route("/admin/fix-hallucinations")
+def fix_hallucinations():
+    import sqlite3
+    con=sqlite3.connect("kingolik.db")
+    con.execute("UPDATE sessions SET translation='', status='recorded' WHERE translation LIKE '%י%'")
+    con.commit(); con.close()
+    return "Cleared hallucinated translations. Refresh dashboard."
 
 
 # ── Co-Pilot ──────────────────────────────────────────────────
@@ -717,8 +794,7 @@ def copilot_api():
     if not q: return jsonify({"error":"query required"}),400
     r=get_copilot_response(q); t=r.get("text","")
     return jsonify({"answer":t,"text":t,"mode":r.get("mode","?"),
-                    "reports_analysed":r.get("snapshot",{}).get("total",0),
-                    "audio":r.get("audio")})
+                    "reports_analysed":r.get("snapshot",{}).get("total",0),"audio":r.get("audio")})
 
 @app.route("/api/copilot/audio/<filename>")
 def copilot_audio(filename):
@@ -726,14 +802,11 @@ def copilot_audio(filename):
     p=f"/tmp/{filename}"
     return send_file(p,mimetype="audio/mpeg") if os.path.exists(p) else (jsonify({"error":"not found"}),404)
 
-
-# ── Health ────────────────────────────────────────────────────
 @app.route("/", methods=["GET","POST"])
 def health():
     if request.method=="POST" and request.form.get("sessionId"): return ussd()
     return jsonify({"status":"Kingolik running","ussd":"*789*1990#","flash":YOUR_NUMBER,
-                    "dashboard":"/dashboard","analytics":"/analytics",
-                    "config":"/test/at-config"}),200
+                    "dashboard":"/dashboard","analytics":"/analytics","config":"/test/at-config"}),200
 
 @socketio.on("connect")
 def on_connect(): Log.ok("WS connected")
@@ -744,10 +817,7 @@ def on_disconnect(): Log.info("WS disconnected")
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
     Log.section("Kingolik NGO Voice Bridge")
-    Log.ok(f"port={port}  number={YOUR_NUMBER}")
-    Log.ok(f"alert={ALERT_PHONE or 'disabled'}  greeting={'custom' if GREETING_AUDIO_URL else 'AT TTS'}")
+    Log.ok(f"port={port}  number={YOUR_NUMBER}  alert={ALERT_PHONE or 'disabled'}")
     Log.ok(f"base={BASE_URL}")
     Log.divider()
-    
-    # This will now safely run using Gevent!
-    socketio.run(app, host="0.0.0.0", port=port, debug=False)
+    socketio.run(app,host="0.0.0.0",port=port,debug=False)
