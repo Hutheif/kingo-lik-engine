@@ -1,5 +1,5 @@
-import eventlet
-eventlet.monkey_patch()
+from gevent import monkey
+monkey.patch_all()
 
 from flask_socketio import SocketIO
 from flask import Flask, request, make_response, jsonify, send_file
@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app      = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
 from dashboard import dashboard_bp
 app.register_blueprint(dashboard_bp)
@@ -748,4 +748,6 @@ if __name__=="__main__":
     Log.ok(f"alert={ALERT_PHONE or 'disabled'}  greeting={'custom' if GREETING_AUDIO_URL else 'AT TTS'}")
     Log.ok(f"base={BASE_URL}")
     Log.divider()
-    socketio.run(app,host="0.0.0.0",port=port,debug=False)
+    
+    # This will now safely run using Gevent!
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)

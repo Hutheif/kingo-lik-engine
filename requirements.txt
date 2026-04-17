@@ -1,15 +1,20 @@
+# Web Framework & Real-time
 flask
 flask-socketio
+gevent
+gevent-websocket
+
+# Production Server
 gunicorn
-uvicorn
+
+# Core Logic & Services
 africastalking
 google-genai
+groq
+requests
+python-dotenv
+
+# Audio & AI Processing
 faster-whisper
 pydub
 deep-translator
-python-dotenv
-requests
-groq
-eventlet
-flask-socketio
-gunicorn
