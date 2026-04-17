@@ -1,20 +1,13 @@
-# Web Framework & Real-time
 flask
-flask-socketio
+flask-socketio   # Web Framework & Real-time
 gevent
 gevent-websocket
-
-# Production Server
-gunicorn
-
-# Core Logic & Services
+gunicorn                      #production server 
 africastalking
 google-genai
-groq
-requests
-python-dotenv
-
-# Audio & AI Processing
 faster-whisper
-pydub
+pydub                            #audio $ai processing and core logic and service 
 deep-translator
+python-dotenv
+requests
+groq
