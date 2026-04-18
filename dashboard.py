@@ -112,7 +112,8 @@ def api_analytics():
     try:
         from database import _count_corrections
         gold_pairs = _count_corrections()
-    except Exception:
+    except Exception as e:
+        print(f"[ANALYTICS] _count_corrections failed: {e}")
         gold_pairs = 0
 
     return jsonify({
@@ -171,14 +172,68 @@ def serve_audio(session_id):
 
 @dashboard_bp.route("/api/save-correction", methods=["POST"])
 def save_correction_route():
-    from database import save_correction
-    data       = request.get_json()
-    session_id = data.get("session_id")
-    correction = data.get("correction", "")
+    from database import save_correction, _count_corrections, get_session
+    data       = request.get_json() or {}
+    session_id = data.get("session_id", "").strip()
+    correction = data.get("correction", "").strip()
+
     if not session_id:
-        return jsonify({"ok": False}), 400
-    save_correction(session_id, correction)
-    return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "session_id required"}), 400
+    if not correction:
+        return jsonify({"ok": False, "error": "correction text is empty"}), 400
+
+    # Verify session exists before trying to save
+    session = get_session(session_id)
+    if not session:
+        # Session might not exist yet — create a minimal record
+        print(f"[HITL] Session {session_id[-8:]} not found — saving correction anyway")
+
+    try:
+        save_correction(session_id, correction)
+        total = _count_corrections()
+        print(f"[HITL] Correction saved → {session_id[-8:]}  total_pairs={total}")
+        return jsonify({
+            "ok": True,
+            "session_id": session_id,
+            "correction": correction,
+            "total": total,
+            "message": f"Gold standard pair #{total} collected"
+        })
+    except Exception as e:
+        print(f"[HITL] Save failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@dashboard_bp.route("/api/hitl/debug")
+def hitl_debug():
+    """Debug endpoint — shows all corrections in the database."""
+    import sqlite3
+    db_path = os.path.join(os.getcwd(), "kingolik.db")
+    try:
+        con = sqlite3.connect(db_path)
+        rows = con.execute(
+            "SELECT session_id, correction, translation FROM sessions "
+            "WHERE correction IS NOT NULL AND correction != '' "
+            "ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        total_count = con.execute(
+            "SELECT COUNT(*) FROM sessions WHERE correction IS NOT NULL AND correction != ''"
+        ).fetchone()[0]
+        con.close()
+        corrections = []
+        for r in rows:
+            corrections.append({
+                "session_id": r[0][-8:],
+                "correction": r[1][:100],
+                "has_translation": bool(r[2])
+            })
+        return jsonify({
+            "total_gold_pairs": total_count,
+            "corrections": corrections,
+            "db_path": db_path
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route("/api/mark-handled", methods=["POST"])
@@ -622,11 +677,21 @@ function setFilter(f,btn){
 
 function timeAgo(iso){
   if(!iso) return '';
-  const d=Math.floor((Date.now()-new Date(iso))/1000);
-  if(d<60) return d+'s ago';
-  if(d<3600) return Math.floor(d/60)+'m ago';
-  if(d<86400) return Math.floor(d/3600)+'h ago';
-  return new Date(iso).toLocaleDateString();
+  const sec=Math.floor((Date.now()-new Date(iso).getTime())/1000);
+  if(sec<5)   return 'just now';
+  if(sec<60)  return sec+'s ago';
+  if(sec<3600) return Math.floor(sec/60)+'m ago';
+  if(sec<86400) return Math.floor(sec/3600)+'h '+(Math.floor((sec%3600)/60))+'m ago';
+  return new Date(iso).toLocaleDateString('en-GB',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+}
+
+// Live timestamp updater — refreshes all card timestamps every 30 seconds
+function startTimestampUpdater(){
+  setInterval(()=>{
+    document.querySelectorAll('[data-ts]').forEach(el=>{
+      el.textContent=timeAgo(el.dataset.ts);
+    });
+  },30000);
 }
 
 function getStatus(s){
@@ -670,7 +735,7 @@ function buildCardHTML(s){
       </div>
       <div style="display:flex;gap:12px;align-items:center">
         <span class="phone">${s.phone||'unknown'}</span>
-        <span class="timestamp">${timeAgo(s.timestamp)}</span>
+        <span class="timestamp" data-ts="${s.timestamp}">${timeAgo(s.timestamp)}</span>
       </div>
     </div>
     ${t.translation?`<div class="translation-block">
@@ -838,11 +903,33 @@ async function saveNote(sid){
 async function saveCorrection(sid){
   const el=document.getElementById('correction-'+sid);
   const btn=document.getElementById('corbtn-'+sid);
-  if(!el||!el.value.trim()) return;
-  await fetch('/api/save-correction',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({session_id:sid,correction:el.value})});
-  if(btn){btn.textContent='Saved as training data ✓';btn.style.color='#15803d';btn.style.fontWeight='600';}
+  if(!el||!el.value.trim()){
+    if(btn){btn.textContent='⚠ Type a correction first';btn.style.color='#dc2626';}
+    setTimeout(()=>{if(btn){btn.textContent='Submit correction';btn.style.color='#16a34a';}},2000);
+    return;
+  }
+  const correctionText=el.value.trim();
+  try{
+    const resp=await fetch('/api/save-correction',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session_id:sid,correction:correctionText})});
+    const data=await resp.json();
+    if(data.ok){
+      if(btn){
+        btn.textContent='✓ Saved as training data (gold pair #'+data.total+')';
+        btn.style.color='#15803d';btn.style.fontWeight='600';
+      }
+      // Update the local session object so analytics reflects it
+      const s=allSessions.find(x=>x.session_id===sid);
+      if(s) s.correction=correctionText;
+    } else {
+      if(btn){btn.textContent='⚠ Save failed — see console';btn.style.color='#dc2626';}
+      console.error('save-correction failed:',data);
+    }
+  } catch(e){
+    if(btn){btn.textContent='⚠ Network error';btn.style.color='#dc2626';}
+    console.error('save-correction error:',e);
+  }
 }
 
 // ── Audio helpers ─────────────────────────────────────────────
@@ -896,6 +983,7 @@ function startLiveTimers(){
 }
 fetchSessions();
 setInterval(fetchSessions,30000);
+startTimestampUpdater();
 </script>
 </body></html>"""
 

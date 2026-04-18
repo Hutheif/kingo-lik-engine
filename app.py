@@ -158,10 +158,11 @@ def _greeting(session_id:str):
         v=f'<Play>{GREETING_AUDIO_URL}</Play>'
     else:
         v=('<Say voice="woman" playBeep="false">'
-           'Habari, karibu King-olik. '
-           'Simu hii ni bure kwako. '
-           'Tafadhali sema ujumbe wako baada ya mlio. '
-           'Bonyeza hash ukimaliza. Asante.'
+           'Asante. This is King-olik. '
+           'We are listening, and we are all here to help you. '
+           'Your voice is our secret and will only be used to rescue you. '
+           'If you accept this, please take a breath, '
+           'report the issue, then hang up.'
            '</Say>')
     return _xml(f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>

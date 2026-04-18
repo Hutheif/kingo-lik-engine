@@ -17,18 +17,43 @@ def _conn():
 
 
 def _migrate():
-    """Add missing columns safely — runs on every startup."""
-    migrations = [
-        "ALTER TABLE sessions ADD COLUMN audio_url TEXT DEFAULT ''",
-        "ALTER TABLE sessions ADD COLUMN notes TEXT DEFAULT ''",
+    """
+    Add missing columns to existing database — runs on every startup.
+    Safe to run multiple times — duplicate column errors are silently ignored.
+    This is how we handle DB schema upgrades without losing data.
+    """
+    # Every column that might be missing from older database files
+    columns_to_add = [
+        ("correction",    "TEXT DEFAULT ''"),
+        ("audio_url",     "TEXT DEFAULT ''"),
+        ("notes",         "TEXT DEFAULT ''"),
+        ("note",          "TEXT DEFAULT ''"),
+        ("recording_url", "TEXT DEFAULT ''"),
+        ("duration",      "TEXT DEFAULT ''"),
+        ("source_wav",    "TEXT DEFAULT ''"),
+        ("handled",       "INTEGER DEFAULT 0"),
+        ("created_at",    "TEXT DEFAULT (datetime('now'))"),
+        ("menu_choice",   "TEXT DEFAULT ''"),
+        ("phone",         "TEXT DEFAULT ''"),
+        ("timestamp",     "TEXT DEFAULT ''"),
+        ("status",        "TEXT DEFAULT 'pending_call'"),
+        ("translation",   "TEXT DEFAULT ''"),
     ]
-    with _conn() as con:
-        for sql in migrations:
-            try:
-                con.execute(sql)
-                con.commit()
-            except Exception:
-                pass  # column already exists
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    added = []
+    for col_name, col_def in columns_to_add:
+        try:
+            con.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_def}")
+            con.commit()
+            added.append(col_name)
+        except sqlite3.OperationalError:
+            pass  # column already exists — expected on clean runs
+    con.close()
+    if added:
+        print(f"[DB] Schema migrated — added columns: {', '.join(added)}")
+    else:
+        print("[DB] Schema up to date — no migrations needed")
 
 
 def init_db():
@@ -217,21 +242,49 @@ def _send_sms_alert(session_id: str, result: dict, keywords: list):
 
 
 def save_correction(session_id: str, correction: str):
+    """
+    Saves a caseworker correction as HITL training data.
+    If session doesn't exist in DB (edge case), creates a minimal record first.
+    Every correction increments the gold pairs counter visible on analytics.
+    """
+    if not correction or not correction.strip():
+        print(f"[HITL] Skipping empty correction for {session_id[-8:]}")
+        return
+
     with _lock, _conn() as con:
+        # Ensure the session row exists — INSERT OR IGNORE creates it if missing
+        con.execute("""
+            INSERT OR IGNORE INTO sessions (session_id, timestamp, created_at)
+            VALUES (?, datetime('now'), datetime('now'))
+        """, (session_id,))
+        # Now update the correction field
         con.execute(
             "UPDATE sessions SET correction=? WHERE session_id=?",
-            (correction, session_id)
+            (correction.strip(), session_id)
         )
         con.commit()
-    print(f"[HITL] Correction saved → {session_id[-8:]}")
+
+    total = _count_corrections()
+    print(f"[HITL] Correction saved → {session_id[-8:]}  correction='{correction[:40]}'  total_pairs={total}")
 
 
 def _count_corrections() -> int:
-    with _conn() as con:
-        row = con.execute(
-            "SELECT COUNT(*) FROM sessions WHERE correction != '' AND correction IS NOT NULL"
-        ).fetchone()
-    return row[0] if row else 0
+    """
+    Counts gold standard correction pairs.
+    A pair = any session where a caseworker has typed a correction.
+    """
+    try:
+        with _conn() as con:
+            row = con.execute(
+                "SELECT COUNT(*) FROM sessions "
+                "WHERE correction IS NOT NULL "
+                "AND TRIM(correction) != ''"
+            ).fetchone()
+        count = row[0] if row else 0
+        return count
+    except Exception as e:
+        print(f"[HITL] Count failed: {e}")
+        return 0
 
 
 def mark_handled(session_id: str):
