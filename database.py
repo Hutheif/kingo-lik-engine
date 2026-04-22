@@ -241,6 +241,14 @@ def _send_sms_alert(session_id: str, result: dict, keywords: list):
         print(f"[SMS] Alert failed: {e}")
 
 
+def delete_session(session_id: str):
+    """Permanently deletes a session record from the database."""
+    with _lock, _conn() as con:
+        con.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+        con.commit()
+    print(f"[DB] Session deleted → {session_id[-8:]}")
+
+
 def save_correction(session_id: str, correction: str):
     """
     Saves a caseworker correction as HITL training data.

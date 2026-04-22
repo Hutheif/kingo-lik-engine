@@ -170,6 +170,20 @@ def serve_audio(session_id):
     return jsonify({"error": "audio_not_found", "session_id": session_id}), 404
 
 
+@dashboard_bp.route("/api/delete-session", methods=["POST"])
+def delete_session_route():
+    from database import delete_session
+    data = request.get_json() or {}
+    session_id = data.get("session_id","").strip()
+    if not session_id:
+        return jsonify({"ok": False, "error": "session_id required"}), 400
+    try:
+        delete_session(session_id)
+        return jsonify({"ok": True, "deleted": session_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @dashboard_bp.route("/api/save-correction", methods=["POST"])
 def save_correction_route():
     from database import save_correction, _count_corrections, get_session
@@ -182,10 +196,8 @@ def save_correction_route():
     if not correction:
         return jsonify({"ok": False, "error": "correction text is empty"}), 400
 
-    # Verify session exists before trying to save
     session = get_session(session_id)
     if not session:
-        # Session might not exist yet — create a minimal record
         print(f"[HITL] Session {session_id[-8:]} not found — saving correction anyway")
 
     try:
@@ -202,7 +214,6 @@ def save_correction_route():
     except Exception as e:
         print(f"[HITL] Save failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @dashboard_bp.route("/api/hitl/debug")
 def hitl_debug():
@@ -736,6 +747,10 @@ function buildCardHTML(s){
       <div style="display:flex;gap:12px;align-items:center">
         <span class="phone">${s.phone||'unknown'}</span>
         <span class="timestamp" data-ts="${s.timestamp}">${timeAgo(s.timestamp)}</span>
+        <button onclick="deleteSession('${sid}')" title="Delete this record"
+          style="background:none;border:none;cursor:pointer;color:#d1d5db;font-size:14px;
+                 padding:2px 4px;border-radius:4px;line-height:1;transition:color 0.15s"
+          onmouseover="this.style.color='#dc2626'" onmouseout="this.style.color='#d1d5db'">✕</button>
       </div>
     </div>
     ${t.translation?`<div class="translation-block">
@@ -880,6 +895,31 @@ function renderCards(){
   });
   filtered.forEach(s=>knownIds.add(s.session_id));
   if(isFirstLoad) isFirstLoad=false;
+}
+
+async function deleteSession(sid){
+  if(!confirm('Delete this record permanently? This cannot be undone.')) return;
+  try{
+    const resp=await fetch('/api/delete-session',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session_id:sid})});
+    const data=await resp.json();
+    if(data.ok){
+      // Remove from local array and DOM immediately
+      allSessions=allSessions.filter(s=>s.session_id!==sid);
+      const card=document.querySelector(`[data-session="${sid}"]`);
+      if(card){
+        card.style.transition='opacity 0.3s,transform 0.3s';
+        card.style.opacity='0'; card.style.transform='translateX(20px)';
+        setTimeout(()=>card.remove(),300);
+      }
+      updateStats();
+    } else {
+      alert('Delete failed: '+(data.error||'unknown error'));
+    }
+  } catch(e){
+    alert('Network error — could not delete');
+  }
 }
 
 async function markHandled(sid){
